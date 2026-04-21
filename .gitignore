@@ -1,0 +1,6 @@
+# Local runtime config — contains IPs, disk serials, email domain, etc.
+# Copy config.example to /etc/daily-health/config and edit.
+config
+*.bak
+*.swp
+.DS_Store

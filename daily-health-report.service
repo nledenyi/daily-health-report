@@ -1,0 +1,6 @@
+[Unit]
+Description=Daily health report for pmx-apps
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/daily-health-report

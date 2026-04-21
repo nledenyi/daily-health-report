@@ -1,0 +1,1582 @@
+#!/bin/bash
+# Daily health report for a Proxmox VE host.
+# Sends summary via Telegram, HTML email, and appends to a markdown log.
+# Environment-specific values (hostnames, IPs, VMIDs, disk serials, email domain,
+# paths) live in /etc/daily-health/config — edit that file, not this script.
+
+CONFIG_FILE="${DAILY_HEALTH_CONFIG:-/etc/daily-health/config}"
+if [ ! -r "$CONFIG_FILE" ]; then
+    echo "daily-health-report: config file not found or unreadable: $CONFIG_FILE" >&2
+    echo "See config.example in the distribution for the required fields." >&2
+    exit 2
+fi
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+# Helper: is-in-array. Usage: in_array "needle" "${array[@]}"
+in_array() {
+    local needle="$1"; shift
+    local x
+    for x in "$@"; do [ "$x" = "$needle" ] && return 0; done
+    return 1
+}
+
+HOSTNAME=$(hostname)
+DATE=$(date '+%Y-%m-%d %H:%M')
+DATE_SHORT=$(date '+%Y-%m-%d')
+LOG_FILE="${LOG_DIR}/daily-health.md"
+ISSUES=()
+
+mkdir -p "$LOG_DIR"
+
+# Helper: convert hours to Xm Xd Xh
+hours_to_mdh() {
+    local h=$1
+    [ "$h" = "?" ] && echo "?" && return
+    h=${h//,/}
+    local months=$((h / 730))
+    local days=$(( (h % 730) / 24 ))
+    local hrs=$((h % 24))
+    if [ "$months" -gt 0 ]; then
+        echo "${months}m ${days}d"
+    elif [ "$days" -gt 0 ]; then
+        echo "${days}d ${hrs}h"
+    else
+        echo "${hrs}h"
+    fi
+}
+
+# --- Check helpers ---
+# emit_issue LEVEL "message" — LEVEL is CRIT | WARN | INFO
+emit_issue() {
+    ISSUES+=("$1|$2")
+}
+
+# SECTIONS registry — populated during Batches 2/3 as sections convert to the
+# function-per-section pattern. Entries: "name|title|render_mode|columns"
+SECTIONS=()
+
+# ===================== Gather Data =====================
+
+# --- Recent Restart Detection ---
+check_recent_restart() {
+    local uptime_secs uptime_mins
+    uptime_secs=$(awk '{print int($1)}' /proc/uptime)
+    if [ "$uptime_secs" -lt 3600 ]; then
+        uptime_mins=$((uptime_secs / 60))
+        emit_issue WARN "System restarted ${uptime_mins}m ago (possible unplanned reboot)"
+    fi
+}
+check_recent_restart
+
+# --- Storage Pools (ZFS + pve-root) ---
+# Exports: POOL_STATUS, POOL_DATA, POOL_OK, POOL_DETAIL, CAP_OK, CAP_DETAIL
+check_storage_pools() {
+    POOL_OK="ok"; POOL_DETAIL=""
+    CAP_OK="ok"; CAP_DETAIL=""
+
+    POOL_STATUS=$(zpool list -H -o name,health)
+    while read -r pool health; do
+        if [ "$health" != "ONLINE" ]; then
+            emit_issue CRIT "Pool $pool is $health"
+            POOL_OK="fail"
+            POOL_DETAIL="${POOL_DETAIL} ${pool}"
+        fi
+    done <<< "$POOL_STATUS"
+
+    POOL_DATA=""
+    while read -r pool size alloc free cap health; do
+        POOL_DATA="${POOL_DATA}${pool}|${size}|${alloc}|${free}|${cap}|${health}\n"
+        cap_num=${cap%\%}
+        if [ "$cap_num" -ge 90 ]; then
+            emit_issue CRIT "Pool $pool at ${cap} capacity"
+            CAP_OK="warn"
+            CAP_DETAIL="${CAP_DETAIL} ${pool}:${cap}"
+        elif [ "$cap_num" -ge 80 ]; then
+            emit_issue WARN "Pool $pool at ${cap} capacity"
+            CAP_OK="warn"
+            CAP_DETAIL="${CAP_DETAIL} ${pool}:${cap}"
+        fi
+    done <<< "$(zpool list -H -o name,size,alloc,free,cap,health)"
+
+    PVE_ROOT_LINE=$(df -h / 2>/dev/null | tail -1)
+    PVE_ROOT_SIZE=$(echo "$PVE_ROOT_LINE" | awk '{print $2}')
+    PVE_ROOT_USED=$(echo "$PVE_ROOT_LINE" | awk '{print $3}')
+    PVE_ROOT_FREE=$(echo "$PVE_ROOT_LINE" | awk '{print $4}')
+    PVE_ROOT_PCT=$(echo "$PVE_ROOT_LINE" | awk '{print $5}')
+    PVE_ROOT_PCT_NUM=${PVE_ROOT_PCT%\%}
+    POOL_DATA="${POOL_DATA}pve-root|${PVE_ROOT_SIZE}|${PVE_ROOT_USED}|${PVE_ROOT_FREE}|${PVE_ROOT_PCT}|ext4\n"
+    if [ "$PVE_ROOT_PCT_NUM" -ge 95 ]; then
+        emit_issue CRIT "pve-root at ${PVE_ROOT_PCT} capacity"
+    elif [ "$PVE_ROOT_PCT_NUM" -ge 85 ]; then
+        emit_issue WARN "pve-root at ${PVE_ROOT_PCT} capacity"
+    fi
+}
+check_storage_pools
+
+# --- Expected Disks (by serial number) ---
+# The EXPECTED_DISKS associative array is populated by the config file.
+# If any of its serials aren't found among probed disks, we raise CRIT.
+
+# --- SMART Health + Missing Disk Detection ---
+# Exports: SMART_DATA, FOUND_SERIALS, SMART_OK, SMART_DETAIL
+check_disks() {
+    SMART_OK="ok"; SMART_DETAIL=""
+    SMART_DATA=""
+    FOUND_SERIALS=()
+    for disk in /dev/sd? /dev/nvme0; do
+        [ -e "$disk" ] || continue
+        smartout=$(smartctl -A "$disk" 2>/dev/null)
+        smartinfo=$(smartctl -i "$disk" 2>/dev/null)
+        serial=$(echo "$smartinfo" | grep -i 'Serial Number' | awk '{print $NF}')
+        FOUND_SERIALS+=("$serial")
+        health=$(smartctl -H "$disk" 2>/dev/null | grep -E 'overall-health|Status' | grep -oE 'PASSED|FAILED|OK' | head -1)
+        temp=$(echo "$smartout" | grep -iE 'temperature|Airflow' | head -1 | awk '{print $10}')
+        if [ -z "$temp" ]; then
+            temp=$(smartctl -A "$disk" 2>/dev/null | grep -i 'Temperature:' | awk '{print $2}')
+        fi
+        hours_raw=$(echo "$smartout" | grep -i 'power_on' | awk '{print $10}')
+        if [ -z "$hours_raw" ]; then
+            hours_raw=$(smartctl -A "$disk" 2>/dev/null | grep -i 'Power On Hours' | awk '{print $NF}' | tr -d ',')
+        fi
+        uncorrect=$(echo "$smartout" | grep -i 'Reported_Uncorrect' | awk '{print $10}')
+        reallocated=$(echo "$smartout" | grep -i 'Reallocated_Sector' | awk '{print $10}')
+        if [ -z "$uncorrect" ]; then
+            uncorrect=$(smartctl -A "$disk" 2>/dev/null | grep -i 'Media and Data Integrity Errors' | awk '{print $NF}')
+        fi
+        [ -z "$uncorrect" ] && uncorrect="0"
+        [ -z "$reallocated" ] && reallocated="0"
+        hours_fmt=$(hours_to_mdh "${hours_raw:-?}")
+        SMART_DATA="${SMART_DATA}${disk}|${health:-N/A}|${temp:-?}°C|${hours_fmt}|${uncorrect}/${reallocated}\n"
+        if [ -n "$health" ] && [ "$health" = "FAILED" ]; then
+            emit_issue CRIT "$disk SMART health: FAILED"
+            SMART_OK="fail"
+            SMART_DETAIL="${SMART_DETAIL} ${disk}"
+        fi
+        if [ "$uncorrect" != "0" ] && [ "$uncorrect" != "" ]; then
+            emit_issue WARN "$disk has $uncorrect uncorrectable errors"
+        fi
+        if [ "$reallocated" != "0" ] && [ "$reallocated" != "" ]; then
+            emit_issue WARN "$disk has $reallocated reallocated sectors"
+        fi
+    done
+
+    for serial in "${!EXPECTED_DISKS[@]}"; do
+        found=false
+        for fs in "${FOUND_SERIALS[@]}"; do
+            if [ "$fs" = "$serial" ]; then
+                found=true
+                break
+            fi
+        done
+        if ! $found; then
+            emit_issue CRIT "Missing disk: ${EXPECTED_DISKS[$serial]} (S/N: $serial)"
+            SMART_DATA="${SMART_DATA}MISSING|MISSING|—|—|${EXPECTED_DISKS[$serial]} (S/N: $serial)\n"
+        fi
+    done
+}
+check_disks
+
+# --- Syncoid Replication ---
+# Exports: SYNCOID_STATUS
+check_syncoid_replication() {
+    SYNCOID_STATUS="OK"
+    [ -z "$SYNCOID_DATASET" ] && { SYNCOID_STATUS="skipped"; return; }
+    LAST_SNAP=$(zfs list -t snapshot -o creation "$SYNCOID_DATASET" 2>/dev/null | tail -1 | xargs)
+    if [ -z "$LAST_SNAP" ]; then
+        emit_issue WARN "No syncoid snapshots on $SYNCOID_DATASET yet"
+        SYNCOID_STATUS="No snapshots"
+    else
+        LAST_EPOCH=$(date -d "$LAST_SNAP" +%s 2>/dev/null)
+        NOW_EPOCH=$(date +%s)
+        if [ -n "$LAST_EPOCH" ]; then
+            AGE_HOURS=$(( (NOW_EPOCH - LAST_EPOCH) / 3600 ))
+            SYNCOID_STATUS="${AGE_HOURS}h ago"
+            if [ "$AGE_HOURS" -gt 48 ]; then
+                emit_issue CRIT "Syncoid replication is ${AGE_HOURS}h old"
+            fi
+        fi
+    fi
+}
+check_syncoid_replication
+
+# --- Sanoid Snapshot Coverage ---
+# Exports: SANOID_TOTAL_DS, SANOID_COVERED_DS, SANOID_UNCOVERED
+check_sanoid_coverage() {
+    SNAP_COUNT=$(zfs list -t snapshot -o name 2>/dev/null | grep autosnap | wc -l)
+    if [ "$SNAP_COUNT" -eq 0 ]; then
+        emit_issue CRIT "No sanoid snapshots found"
+    fi
+
+    SANOID_MANAGED=$(grep '^\[' /etc/sanoid/sanoid.conf 2>/dev/null | grep -v template | tr -d '[]')
+    SANOID_UNCOVERED=""
+    SANOID_TOTAL_DS=0
+    SANOID_COVERED_DS=0
+
+    ALL_ZFS_GUEST_DS=$(grep -h 'rootfs:\|scsi0:\|virtio0:' /etc/pve/nodes/${PVE_NODE}/qemu-server/*.conf /etc/pve/nodes/${PVE_NODE}/lxc/*.conf 2>/dev/null | grep -oE "${ZFS_POOLS_REGEX}[^ ,]*" | sed 's/:/\//' | sort -u)
+
+    for ds in $ALL_ZFS_GUEST_DS; do
+        SANOID_TOTAL_DS=$((SANOID_TOTAL_DS + 1))
+        if echo "$SANOID_MANAGED" | grep -qF "$ds"; then
+            SANOID_COVERED_DS=$((SANOID_COVERED_DS + 1))
+        else
+            dsname=$(echo "$ds" | sed 's/.*\///')
+            owner=$(grep -rl "$dsname" /etc/pve/nodes/${PVE_NODE}/qemu-server/ /etc/pve/nodes/${PVE_NODE}/lxc/ 2>/dev/null | head -1 | grep -oE '[0-9]+' | tail -1)
+            SANOID_UNCOVERED="${SANOID_UNCOVERED}${ds} (VMID ${owner:-?})\n"
+        fi
+    done
+
+    if [ -n "$SANOID_UNCOVERED" ]; then
+        emit_issue WARN "Sanoid: ${SANOID_COVERED_DS}/${SANOID_TOTAL_DS} ZFS guest datasets covered — missing: $(echo -e "$SANOID_UNCOVERED" | tr '\n' ',' | sed 's/,$//')"
+    fi
+    [ "$SANOID_COVERED_DS" = "$SANOID_TOTAL_DS" ] && SANOID_COV="ok" || SANOID_COV="warn"
+}
+check_sanoid_coverage
+
+# Helper: timestamp to "Xd Xh ago"
+time_ago() {
+    local ts="$1"
+    [ -z "$ts" ] || [ "$ts" = "n/a" ] && echo "Unknown" && return
+    local epoch=$(date -d "$ts" +%s 2>/dev/null)
+    [ -z "$epoch" ] && echo "Unknown" && return
+    local now=$(date +%s)
+    local diff=$(( (now - epoch) / 60 ))
+    local mins=$((diff % 60))
+    local hrs=$(( (diff / 60) % 24 ))
+    local days=$((diff / 1440))
+    if [ "$days" -gt 0 ]; then
+        echo "${days}d ${hrs}h ago"
+    elif [ "$hrs" -gt 0 ]; then
+        echo "${hrs}h ${mins}m ago"
+    else
+        echo "${mins}m ago"
+    fi
+}
+
+# --- Sanoid Service Status ---
+# Exports: SANOID_LAST_FMT, SANOID_LAST_EXIT, SANOID_STATUS_TEXT, SANOID_STATUS_COLOR
+check_sanoid_service() {
+    SANOID_LAST_RUN=$(systemctl show sanoid.service --property=ExecMainStartTimestamp --value 2>/dev/null)
+    SANOID_LAST_EXIT=$(systemctl show sanoid.service --property=ExecMainStatus --value 2>/dev/null)
+    SANOID_LAST_FMT=$(time_ago "$SANOID_LAST_RUN")
+    if [ "$SANOID_LAST_EXIT" = "0" ]; then
+        SANOID_STATUS_TEXT="OK"
+        SANOID_STATUS_COLOR="#2ecc71"
+        SANOID_OK="ok"
+    else
+        SANOID_STATUS_TEXT="FAILED (exit $SANOID_LAST_EXIT)"
+        SANOID_STATUS_COLOR="#e74c3c"
+        SANOID_OK="fail"
+        emit_issue CRIT "Sanoid last run failed (exit $SANOID_LAST_EXIT)"
+    fi
+}
+check_sanoid_service
+
+# --- Syncoid Service Status ---
+# Exports: SYNCOID_SVC_LAST_FMT, SYNCOID_SVC_LAST_EXIT, SYNCOID_SVC_STATUS_TEXT, SYNCOID_SVC_STATUS_COLOR
+check_syncoid_service() {
+    SYNCOID_SVC_LAST_RUN=$(systemctl show syncoid-personal.service --property=ExecMainStartTimestamp --value 2>/dev/null)
+    SYNCOID_SVC_LAST_EXIT=$(systemctl show syncoid-personal.service --property=ExecMainStatus --value 2>/dev/null)
+    SYNCOID_SVC_LAST_FMT=$(time_ago "$SYNCOID_SVC_LAST_RUN")
+    if [ "$SYNCOID_SVC_LAST_EXIT" = "0" ]; then
+        SYNCOID_SVC_STATUS_TEXT="OK"
+        SYNCOID_SVC_STATUS_COLOR="#2ecc71"
+        SYNCOID_OK="ok"
+    else
+        SYNCOID_SVC_STATUS_TEXT="FAILED (exit $SYNCOID_SVC_LAST_EXIT)"
+        SYNCOID_SVC_STATUS_COLOR="#e74c3c"
+        SYNCOID_OK="fail"
+    fi
+}
+check_syncoid_service
+
+# --- PVE Vzdump Backups ---
+# Exports: VZDUMP_VMIDS, TOTAL_GUESTS, VZDUMP_LAST_FMT
+check_vzdump() {
+    VZDUMP_VMIDS=$(pvesh get /cluster/backup --output-format json 2>/dev/null | python3 -c "
+import sys,json
+jobs=json.load(sys.stdin)
+vmids=set()
+for j in jobs:
+    for v in j.get('vmid','').split(','):
+        if v.strip(): vmids.add(v.strip())
+print(len(vmids))
+" 2>/dev/null)
+    VZDUMP_VMIDS=${VZDUMP_VMIDS:-0}
+    TOTAL_GUESTS=$(( $(ls /etc/pve/nodes/${PVE_NODE}/qemu-server/*.conf 2>/dev/null | wc -l) + $(ls /etc/pve/nodes/${PVE_NODE}/lxc/*.conf 2>/dev/null | wc -l) ))
+    VZDUMP_LAST=$(ls -t ${VZDUMP_LOG_GLOB} 2>/dev/null | head -1)
+    if [ -n "$VZDUMP_LAST" ]; then
+        VZDUMP_LAST_TS=$(stat -c '%Y' "$VZDUMP_LAST" 2>/dev/null)
+        VZDUMP_LAST_FMT=$(time_ago "$(date -d @"$VZDUMP_LAST_TS" 2>/dev/null)")
+    else
+        VZDUMP_LAST_FMT="Never"
+    fi
+}
+check_vzdump
+
+# --- VM/LXC Status ---
+# Exports: GUEST_DATA, LXC_UPDATE_SUMMARY, GUEST_OK, GUEST_DETAIL
+check_guests() {
+    GUEST_OK="ok"; GUEST_DETAIL=""
+    GUEST_DATA=""
+    for vmid in "${VM_IDS[@]}"; do
+        STATUS=$(qm status $vmid 2>/dev/null | awk '{print $2}')
+        NAME=$(qm config $vmid 2>/dev/null | grep '^name:' | awk '{print $2}')
+        MEM_TOTAL=$(qm config $vmid 2>/dev/null | grep '^memory:' | awk '{print $2}')
+        if [ "$STATUS" = "running" ]; then
+            MEM_USED_MB=$(qm guest exec $vmid -- free -m 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); lines=d.get('out-data','').split('\n'); mem=[l for l in lines if l.startswith('Mem:')]; print(mem[0].split()[2]) if mem else print(0)" 2>/dev/null)
+            MEM_USED_MB=${MEM_USED_MB:-0}
+            if [ "$MEM_TOTAL" -ge 1024 ]; then
+                MEM_USED_G=$(awk "BEGIN {printf \"%.1f\", $MEM_USED_MB/1024}")
+                MEM_TOTAL_G=$((MEM_TOTAL / 1024))
+                MEM_STR="${MEM_USED_G}/${MEM_TOTAL_G}G"
+            else
+                MEM_STR="${MEM_USED_MB}/${MEM_TOTAL}M"
+            fi
+            if in_array "$vmid" "${HASS_OS_VM_IDS[@]}"; then
+                DISK_RAW=$(qm guest exec $vmid -- df -h /mnt/data 2>/dev/null)
+            else
+                DISK_RAW=$(qm guest exec $vmid -- df -h / 2>/dev/null)
+            fi
+            DISK_INFO=$(echo "$DISK_RAW" | python3 -c "import sys,json; d=json.load(sys.stdin); lines=d.get('out-data','').strip().split('\n'); parts=lines[-1].split() if len(lines)>1 else []; print(f'{parts[2]}/{parts[1]}') if len(parts)>=4 else print('?/?')" 2>/dev/null)
+            DISK_PCT=$(echo "$DISK_RAW" | python3 -c "import sys,json; d=json.load(sys.stdin); lines=d.get('out-data','').strip().split('\n'); parts=lines[-1].split() if len(lines)>1 else []; pct=parts[4].rstrip('%') if len(parts)>=5 else '0'; print(pct)" 2>/dev/null)
+            if [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge 95 ] 2>/dev/null; then
+                emit_issue CRIT "VM $vmid ($NAME) disk at ${DISK_PCT}%"
+            elif [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge 85 ] 2>/dev/null; then
+                emit_issue WARN "VM $vmid ($NAME) disk at ${DISK_PCT}%"
+            fi
+        else
+            if [ "$MEM_TOTAL" -ge 1024 ]; then
+                MEM_STR="-/${MEM_TOTAL_G:-$((MEM_TOTAL / 1024))}G"
+            else
+                MEM_STR="-/${MEM_TOTAL}M"
+            fi
+            DISK_INFO="-"
+        fi
+        GUEST_DATA="${GUEST_DATA}${NAME}|${STATUS}|${MEM_STR}|${DISK_INFO}\n"
+        if ! in_array "$vmid" "${VM_EXPECTED_STOPPED[@]}" && [ "$STATUS" != "running" ]; then
+            emit_issue CRIT "VM $vmid ($NAME) is $STATUS"
+            GUEST_OK="fail"
+            GUEST_DETAIL="${GUEST_DETAIL} ${NAME}"
+        fi
+    done
+    LXC_UPDATE_SUMMARY=""
+    for ctid in $(pct list 2>/dev/null | awk 'NR>1 {print $1}' | sort -n); do
+        STATUS=$(pct status $ctid 2>/dev/null | awk '{print $2}')
+        NAME=$(pct config $ctid 2>/dev/null | grep '^hostname:' | awk '{print $2}')
+        MEM_TOTAL=$(pct config $ctid 2>/dev/null | grep '^memory:' | awk '{print $2}')
+        if [ "$STATUS" = "running" ]; then
+            MEM_USED_MB=$(pct exec $ctid -- free -m 2>/dev/null | awk '/Mem:/ {print $3}')
+            MEM_USED_MB=${MEM_USED_MB:-0}
+            if [ "$MEM_TOTAL" -ge 1024 ]; then
+                MEM_USED_G=$(awk "BEGIN {printf \"%.1f\", $MEM_USED_MB/1024}")
+                MEM_TOTAL_G=$((MEM_TOTAL / 1024))
+                MEM_STR="${MEM_USED_G}/${MEM_TOTAL_G}G"
+            else
+                MEM_STR="${MEM_USED_MB}/${MEM_TOTAL}M"
+            fi
+            DISK_INFO=$(pct exec $ctid -- df -h / 2>/dev/null | awk 'NR==2 {print $3"/"$2}')
+            DISK_PCT=$(pct exec $ctid -- df / 2>/dev/null | awk 'NR==2 {gsub(/%/,""); print $5}')
+            if [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge 95 ] 2>/dev/null; then
+                emit_issue CRIT "LXC $ctid ($NAME) disk at ${DISK_PCT}%"
+            elif [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge 85 ] 2>/dev/null; then
+                emit_issue WARN "LXC $ctid ($NAME) disk at ${DISK_PCT}%"
+            fi
+            LXC_UPG_COUNT=$(pct exec $ctid -- bash -c 'apt-get -s dist-upgrade 2>/dev/null | grep -c ^Inst' 2>/dev/null)
+            LXC_UPG_COUNT=${LXC_UPG_COUNT:-0}
+            if [ "$LXC_UPG_COUNT" -gt 0 ] 2>/dev/null; then
+                emit_issue WARN "LXC $ctid ($NAME) has ${LXC_UPG_COUNT} pending apt update(s)"
+                LXC_UPDATE_SUMMARY="${LXC_UPDATE_SUMMARY}${NAME}:${LXC_UPG_COUNT} "
+            fi
+        else
+            if [ "$MEM_TOTAL" -ge 1024 ]; then
+                MEM_STR="-/${MEM_TOTAL_G:-$((MEM_TOTAL / 1024))}G"
+            else
+                MEM_STR="-/${MEM_TOTAL}M"
+            fi
+            DISK_INFO="-"
+        fi
+        GUEST_DATA="${GUEST_DATA}${NAME}|${STATUS}|${MEM_STR}|${DISK_INFO}\n"
+        if [ "$STATUS" != "running" ]; then
+            emit_issue CRIT "LXC $ctid ($NAME) is $STATUS"
+            GUEST_OK="fail"
+            GUEST_DETAIL="${GUEST_DETAIL} ${NAME}"
+        fi
+    done
+    LXC_UPDATE_SUMMARY="${LXC_UPDATE_SUMMARY% }"
+}
+check_guests
+
+# --- Postfix Queue ---
+check_postfix_queue() {
+    local deferred
+    deferred=$(postqueue -p 2>/dev/null | tail -1)
+    if echo "$deferred" | grep -qE "[0-9]+ Request"; then
+        emit_issue WARN "Deferred mail in queue: $deferred"
+    fi
+}
+check_postfix_queue
+
+# --- Docker Container Health (VM 104 + LXC 105) ---
+# Exports: DOCKER_CRIT_DATA, DOCKER_CRIT_COUNT, DOCKER_CRIT_UP, DOCKER_OTHER_RUNNING,
+#          DOCKER_OTHER_TOTAL, DOCKER_STOPPED_DATA, DOCKER_PS (non-empty = any host scanned)
+# Helper: inspect-row format (name|state|health|exit|restart); scan_docker_host parses it
+_DOCKER_FMT='{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}|{{.State.ExitCode}}|{{.HostConfig.RestartPolicy.Name}}'
+
+scan_docker_host() {
+    local host_label="$1"
+    local inspect_output="$2"
+    local dname dstate dhealth exit_code restart_pol is_crit stop_reason pat ex
+    while IFS='|' read -r dname dstate dhealth exit_code restart_pol; do
+        [ -z "$dname" ] && continue
+        dname="${dname#/}"
+        is_crit=false
+        for pat in "${DOCKER_CRITICAL_PATTERNS[@]}"; do
+            # shellcheck disable=SC2053
+            if [[ "$dname" == $pat ]]; then
+                is_crit=true
+                for ex in "${DOCKER_CRITICAL_EXCLUDE[@]}"; do
+                    # shellcheck disable=SC2053
+                    if [[ "$dname" == $ex ]]; then is_crit=false; break; fi
+                done
+                break
+            fi
+        done
+        if $is_crit; then
+            DOCKER_CRIT_COUNT=$((DOCKER_CRIT_COUNT + 1))
+            DOCKER_CRIT_DATA="${DOCKER_CRIT_DATA}${dname}|${dstate}\n"
+            if [ "$dstate" = "running" ]; then
+                if [ "$dhealth" = "unhealthy" ]; then
+                    emit_issue CRIT "Docker critical: ${dname} is unhealthy (${host_label})"
+                else
+                    DOCKER_CRIT_UP=$((DOCKER_CRIT_UP + 1))
+                fi
+            else
+                emit_issue CRIT "Docker critical: ${dname} is ${dstate} (${host_label})"
+            fi
+        else
+            DOCKER_OTHER_TOTAL=$((DOCKER_OTHER_TOTAL + 1))
+            if [ "$dstate" = "running" ]; then
+                if [ "$dhealth" = "unhealthy" ]; then
+                    emit_issue WARN "Docker container unhealthy: ${dname} (${host_label})"
+                    DOCKER_STOPPED_DATA="${DOCKER_STOPPED_DATA}${dname}|unhealthy\n"
+                else
+                    DOCKER_OTHER_RUNNING=$((DOCKER_OTHER_RUNNING + 1))
+                fi
+            else
+                if [ "$restart_pol" = "no" ] && [ "$exit_code" = "0" ]; then
+                    stop_reason="manual"
+                elif [ "$exit_code" != "0" ] && [ -n "$exit_code" ]; then
+                    stop_reason="crashed (exit ${exit_code})"
+                    emit_issue WARN "Docker container crashed: ${dname} (exit ${exit_code}, ${host_label})"
+                elif [ "$dstate" = "restarting" ]; then
+                    stop_reason="crash loop"
+                    emit_issue CRIT "Docker container in crash loop: ${dname} (${host_label})"
+                else
+                    stop_reason="stopped"
+                fi
+                DOCKER_STOPPED_DATA="${DOCKER_STOPPED_DATA}${dname}|${stop_reason}\n"
+            fi
+        fi
+    done <<< "$inspect_output"
+}
+
+check_docker() {
+    DOCKER_CRIT_DATA=""
+    DOCKER_OTHER_RUNNING=0
+    DOCKER_OTHER_TOTAL=0
+    DOCKER_CRIT_COUNT=0
+    DOCKER_CRIT_UP=0
+    DOCKER_STOPPED_DATA=""
+    DOCKER_PS=""
+
+    if [ -n "$DOCKER_VM" ] && qm status "$DOCKER_VM" 2>/dev/null | grep -q running; then
+        VM_INSPECT=$(qm guest exec "$DOCKER_VM" -- bash -c "docker ps -aq | xargs -r docker inspect --format '${_DOCKER_FMT}'" 2>/dev/null | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('out-data',''))" 2>/dev/null)
+        if [ -n "$VM_INSPECT" ]; then
+            scan_docker_host "VM $DOCKER_VM" "$VM_INSPECT"
+            DOCKER_PS="$VM_INSPECT"
+        fi
+    fi
+
+    if [ -n "$DOCKER_IN_LXC" ] && pct status "$DOCKER_IN_LXC" 2>/dev/null | grep -q running; then
+        LXC_INSPECT=$(pct exec "$DOCKER_IN_LXC" -- bash -c "docker ps -aq | xargs -r docker inspect --format '${_DOCKER_FMT}'" 2>/dev/null)
+        if [ -n "$LXC_INSPECT" ]; then
+            scan_docker_host "LXC $DOCKER_IN_LXC" "$LXC_INSPECT"
+            DOCKER_PS="${DOCKER_PS}${LXC_INSPECT}"
+        fi
+    fi
+}
+check_docker
+
+# --- Service Health Checks ---
+check_services() {
+    local ha_http pg_ready
+    if [ -n "$HA_URL" ]; then
+        ha_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 "$HA_URL" 2>/dev/null)
+        if [ "$ha_http" != "200" ] && [ "$ha_http" != "401" ] && [ "$ha_http" != "403" ]; then
+            emit_issue CRIT "Home Assistant not responding (HTTP ${ha_http:-timeout})"
+        fi
+    fi
+    if [ -n "$POSTGRES_LXC" ] && pct status "$POSTGRES_LXC" 2>/dev/null | grep -q running; then
+        pg_ready=$(pct exec "$POSTGRES_LXC" -- pg_isready 2>&1)
+        if ! echo "$pg_ready" | grep -q "accepting connections"; then
+            emit_issue CRIT "PostgreSQL (LXC $POSTGRES_LXC) not accepting connections"
+        fi
+    fi
+    if ! nvidia-smi --query-gpu=name --format=csv,noheader &>/dev/null; then
+        emit_issue WARN "NVIDIA GPU driver not responding"
+    fi
+    if [ -n "${AMD_KFD_LXCS[*]}" ] && [ ! -e /dev/kfd ]; then
+        emit_issue WARN "AMD GPU /dev/kfd missing (driver issue)"
+    fi
+}
+check_services
+
+# GPU cgroup major number mismatch (dynamic majors shift across reboots)
+check_gpu_cgroup_majors() {
+    local nvuvm_major kfd_major stale ct_name ctid
+    if [ -e /dev/nvidia-uvm ] && [ -n "${NVIDIA_UVM_LXCS[*]}" ]; then
+        nvuvm_major=$(stat -c '%Hr' /dev/nvidia-uvm)
+        for ctid in "${NVIDIA_UVM_LXCS[@]}"; do
+            if ! grep -qP "lxc\\.cgroup2\\.devices\\.allow: c ${nvuvm_major}:\\*" /etc/pve/lxc/${ctid}.conf 2>/dev/null; then
+                stale=$(grep 'lxc.cgroup2.devices.allow:' /etc/pve/lxc/${ctid}.conf 2>/dev/null | grep -vE 'c (195|226|189|510):' | grep -oP 'c \K[0-9]+' | head -1)
+                ct_name=$(pct config $ctid 2>/dev/null | grep '^hostname:' | awk '{print $2}')
+                emit_issue CRIT "LXC ${ctid} (${ct_name}) nvidia-uvm cgroup major mismatch: config has ${stale:-?}, actual is ${nvuvm_major} — GPU decoding broken, restart LXC after running fix-lxc-gpu-majors"
+            fi
+        done
+    fi
+    if [ -e /dev/kfd ] && [ -n "${AMD_KFD_LXCS[*]}" ]; then
+        kfd_major=$(stat -c '%Hr' /dev/kfd)
+        for ctid in "${AMD_KFD_LXCS[@]}"; do
+            if ! grep -qP "lxc\\.cgroup2\\.devices\\.allow: c ${kfd_major}:\\*" /etc/pve/lxc/${ctid}.conf 2>/dev/null; then
+                stale=$(grep 'lxc.cgroup2.devices.allow:' /etc/pve/lxc/${ctid}.conf 2>/dev/null | grep -vE 'c 226:' | grep -oP 'c \K[0-9]+' | head -1)
+                ct_name=$(pct config $ctid 2>/dev/null | grep '^hostname:' | awk '{print $2}')
+                emit_issue CRIT "LXC ${ctid} (${ct_name}) KFD cgroup major mismatch: config has ${stale:-?}, actual is ${kfd_major} — AMD GPU broken, restart LXC after running fix-lxc-gpu-majors"
+            fi
+        done
+    fi
+}
+check_gpu_cgroup_majors
+# TLS certificate expiry (check from Docker VM)
+if [ -n "$DOCKER_PS" ]; then
+    DOCKER_VM_IP=$(qm guest exec 104 -- hostname -I 2>/dev/null | \
+        python3 -c "import sys,json; d=json.load(sys.stdin); ips=d.get('out-data','').strip().split(); print(ips[0] if ips else '')" 2>/dev/null)
+    if [ -n "$DOCKER_VM_IP" ]; then
+        CERT_END=$(echo | openssl s_client -connect "${DOCKER_VM_IP}:443" 2>/dev/null | \
+            openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+        if [ -n "$CERT_END" ]; then
+            CERT_EPOCH=$(date -d "$CERT_END" +%s 2>/dev/null)
+            CERT_DAYS=$(( (CERT_EPOCH - $(date +%s)) / 86400 ))
+            if [ "$CERT_DAYS" -lt 7 ]; then
+                ISSUES+=("CRIT|TLS cert expires in ${CERT_DAYS} days")
+            elif [ "$CERT_DAYS" -lt 14 ]; then
+                ISSUES+=("WARN|TLS cert expires in ${CERT_DAYS} days")
+            fi
+        fi
+    fi
+fi
+
+# Claude Code Remote Control (systemd + tmux)
+check_claude_remote() {
+    if ! systemctl is-active --quiet claude-remote; then
+        emit_issue CRIT "claude-remote.service not active"
+    elif ! pgrep -f "claude remote-control" >/dev/null 2>&1; then
+        emit_issue CRIT "claude-remote.service active but no claude remote-control process running"
+    fi
+}
+check_claude_remote
+
+# Syncthing (shared Docker container behind the PVE node or on the Docker VM)
+# Skipped entirely unless both a URL can be resolved and the config XML is readable.
+_st_url="${SYNCTHING_URL}"
+[ -z "$_st_url" ] && [ -n "$DOCKER_VM_IP" ] && _st_url="http://${DOCKER_VM_IP}:8384"
+if [ -n "$_st_url" ] && [ -r "$SYNCTHING_CONFIG_XML" ]; then
+    ST_APIKEY=$(grep -oP "<apikey>\K[^<]+" "$SYNCTHING_CONFIG_XML" 2>/dev/null | head -1)
+    if [ -n "$ST_APIKEY" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && ISSUES+=("$line")
+        done < <(ST_APIKEY="$ST_APIKEY" ST_URL="$_st_url" python3 - <<'PYEOF'
+import os, sys, json, urllib.request
+from datetime import datetime, timezone
+
+URL = os.environ['ST_URL']
+KEY = os.environ['ST_APIKEY']
+
+def get(path):
+    req = urllib.request.Request(URL + path, headers={'X-API-Key': KEY})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+try:
+    if get('/rest/system/ping').get('ping') != 'pong':
+        print('CRIT|Syncthing API ping returned unexpected response')
+        sys.exit(0)
+except Exception as e:
+    print(f'CRIT|Syncthing API unreachable ({type(e).__name__})')
+    sys.exit(0)
+
+try:
+    sys_errs = get('/rest/system/error').get('errors') or []
+    if sys_errs:
+        print(f'WARN|Syncthing: {len(sys_errs)} system-level error(s)')
+except Exception:
+    pass
+
+try:
+    for f in get('/rest/config/folders'):
+        st = get(f"/rest/db/status?folder={f['id']}")
+        pe = st.get('pullErrors', 0)
+        if pe > 0:
+            print(f"WARN|Syncthing folder '{f['label']}': {pe} pull error(s)")
+except Exception:
+    pass
+
+try:
+    devices = {d['deviceID']: d['name'] for d in get('/rest/config/devices')}
+    conns = get('/rest/system/connections').get('connections', {})
+    stats = get('/rest/stats/device')
+    now = datetime.now(timezone.utc)
+    for dev_id, info in conns.items():
+        if info.get('connected') or info.get('paused'):
+            continue
+        name = devices.get(dev_id, dev_id[:8])
+        last = (stats.get(dev_id) or {}).get('lastSeen') or info.get('lastSeen') or ''
+        if not last or last.startswith('0001'):
+            print(f"WARN|Syncthing peer '{name}' has never connected")
+            continue
+        try:
+            dt = datetime.fromisoformat(last.replace('Z', '+00:00'))
+            hrs = int((now - dt).total_seconds() / 3600)
+            if hrs > 24:
+                print(f"WARN|Syncthing peer '{name}' offline {hrs}h")
+        except Exception:
+            pass
+except Exception:
+    pass
+PYEOF
+)
+    fi
+fi
+
+# --- Unattended Upgrades + Package NEWS ---
+# Exports: UAU_PKG_COUNT, UAU_REBOOT_REQUIRED, UAU_LAST_FMT, UAU_LAST_EXIT,
+#          UAU_STATUS_TEXT, UAU_STATUS_COLOR, APT_NEWS, APT_NEWS_COUNT
+check_upgrades() {
+    UAU_LOG="/var/log/unattended-upgrades/unattended-upgrades.log"
+    UAU_TODAY=$(date '+%Y-%m-%d')
+    UAU_UPGRADED=""
+    UAU_ERROR=""
+    UAU_PKG_COUNT=0
+    if [ -f "$UAU_LOG" ]; then
+        UAU_TODAY_LOG=$(grep "^${UAU_TODAY}" "$UAU_LOG" 2>/dev/null)
+        UAU_UPGRADED=$(echo "$UAU_TODAY_LOG" | grep -oP 'Packages that will be upgraded: \K.*' | tail -1)
+        if [ -n "$UAU_UPGRADED" ]; then
+            UAU_PKG_COUNT=$(echo "$UAU_UPGRADED" | wc -w)
+        fi
+        if echo "$UAU_TODAY_LOG" | grep -qiE 'ERROR|WARNING.*dpkg|failed'; then
+            UAU_ERROR=$(echo "$UAU_TODAY_LOG" | grep -iE 'ERROR|WARNING.*dpkg|failed' | tail -1)
+        fi
+    fi
+    UAU_REBOOT_REQUIRED="no"
+    if [ -f /var/run/reboot-required ]; then
+        UAU_REBOOT_REQUIRED="yes"
+        emit_issue WARN "Reboot required (unattended-upgrades)"
+    fi
+    if [ -n "$UAU_ERROR" ]; then
+        emit_issue CRIT "Unattended-upgrades error: ${UAU_ERROR}"
+    fi
+
+    # Package NEWS (apt-listchanges replacement)
+    APT_NEWS=""
+    APT_NEWS_COUNT=0
+    if [ -f /var/log/dpkg.log ]; then
+        YESTERDAY=$(date -d '24 hours ago' '+%Y-%m-%d %H:%M:%S')
+        RECENT_PKGS=$(awk -v since="$YESTERDAY" '$0 >= since && / upgrade / {print $4}' /var/log/dpkg.log 2>/dev/null | sort -u)
+        for pkg in $RECENT_PKGS; do
+            news_file="/usr/share/doc/${pkg}/NEWS.Debian.gz"
+            if [ -f "$news_file" ]; then
+                APT_NEWS="${APT_NEWS}${pkg}, "
+                APT_NEWS_COUNT=$((APT_NEWS_COUNT + 1))
+            fi
+        done
+        APT_NEWS="${APT_NEWS%, }"
+    fi
+    if [ "$APT_NEWS_COUNT" -gt 0 ]; then
+        emit_issue INFO "${APT_NEWS_COUNT} upgraded package(s) with NEWS: ${APT_NEWS}"
+    fi
+
+    # Status for maintenance table
+    UAU_LAST_RUN=$(systemctl show apt-daily-upgrade.service --property=ExecMainStartTimestamp --value 2>/dev/null)
+    UAU_LAST_EXIT=$(systemctl show apt-daily-upgrade.service --property=ExecMainStatus --value 2>/dev/null)
+    UAU_LAST_FMT=$(time_ago "$UAU_LAST_RUN")
+    if [ -n "$UAU_ERROR" ]; then
+        UAU_STATUS_TEXT="ERROR"
+        UAU_STATUS_COLOR="#e74c3c"
+    elif [ "$UAU_PKG_COUNT" -gt 0 ]; then
+        UAU_STATUS_TEXT="${UAU_PKG_COUNT} upgraded"
+        UAU_STATUS_COLOR="#3498db"
+    elif [ "$UAU_LAST_EXIT" = "0" ]; then
+        UAU_STATUS_TEXT="OK (no updates)"
+        UAU_STATUS_COLOR="#2ecc71"
+    else
+        UAU_STATUS_TEXT="OK (no updates)"
+        UAU_STATUS_COLOR="#2ecc71"
+    fi
+}
+check_upgrades
+
+# --- ZFS Scrub Status ---
+# Exports: SCRUB_DATA
+check_scrub() {
+    SCRUB_DATA=""
+    while read -r pool; do
+        [ -z "$pool" ] && continue
+        scrub_line=$(zpool status "$pool" 2>/dev/null | grep -A1 'scan:' | head -2)
+        scrub_date=$(echo "$scrub_line" | grep -oP 'on \K\w+ \w+ +\d+ \d+:\d+:\d+ \d+' | head -1)
+        scrub_errors=$(echo "$scrub_line" | grep -oP '\d+ errors' | head -1)
+        if [ -n "$scrub_date" ]; then
+            scrub_fmt=$(time_ago "$scrub_date")
+            scrub_errs="${scrub_errors:-0 errors}"
+        else
+            scrub_fmt="Never"
+            scrub_errs="—"
+        fi
+        SCRUB_DATA="${SCRUB_DATA}${pool}|${scrub_fmt}|${scrub_errs}\n"
+        if [ -n "$scrub_errors" ] && [ "$scrub_errors" != "0 errors" ]; then
+            emit_issue WARN "ZFS scrub on $pool reported $scrub_errors"
+        fi
+    done <<< "$(zpool list -H -o name)"
+}
+check_scrub
+
+
+# --- Ollama (LXC 106) ---
+# Exports: OLLAMA_OK + 15 OLLAMA_* fields used by the Ollama section renderer
+check_ollama() {
+    OLLAMA_OK="unknown"
+    OLLAMA_VERSION=""
+    OLLAMA_MODELS_COUNT=0
+    OLLAMA_MODELS_SIZE=""
+    OLLAMA_LOADED_MODELS=""
+    OLLAMA_GPU_OFFLOAD=""
+    OLLAMA_REQ_24H=0
+    OLLAMA_ERR_24H=0
+    OLLAMA_IDLE_TIME=""
+    OLLAMA_AVG_DURATION=""
+    OLLAMA_CLIENTS=""
+    OLLAMA_TOKENS_GENERATED=0
+    OLLAMA_TOKENS_PROMPT=0
+    OLLAMA_TOK_PER_SEC=""
+
+    [ -z "$OLLAMA_API" ] && { OLLAMA_OK="skipped"; return; }
+
+    if [ -n "$OLLAMA_LXC" ] && ! pct status "$OLLAMA_LXC" 2>/dev/null | grep -q running; then
+        OLLAMA_OK="fail"
+        emit_issue CRIT "Ollama LXC $OLLAMA_LXC is not running"
+        return
+    fi
+
+    OLLAMA_VERSION=$(curl -s --connect-timeout 3 "${OLLAMA_API}/api/version" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('version','?'))" 2>/dev/null)
+    if [ -z "$OLLAMA_VERSION" ] || [ "$OLLAMA_VERSION" = "?" ]; then
+        OLLAMA_OK="fail"
+        emit_issue CRIT "Ollama API ($OLLAMA_API) not responding"
+        return
+    fi
+    OLLAMA_OK="ok"
+
+    OLLAMA_LATEST=$(curl -s --connect-timeout 5 "$OLLAMA_RELEASES_API" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name','').lstrip('v'))" 2>/dev/null)
+    OLLAMA_UPDATE_AVAIL=""
+    if [ -n "$OLLAMA_LATEST" ] && [ "$OLLAMA_LATEST" != "$OLLAMA_VERSION" ]; then
+        OLLAMA_UPDATE_AVAIL="$OLLAMA_LATEST"
+        emit_issue WARN "Ollama update available: ${OLLAMA_VERSION} -> ${OLLAMA_LATEST}"
+    fi
+
+    TAGS_JSON=$(curl -s --connect-timeout 3 "${OLLAMA_API}/api/tags" 2>/dev/null)
+    OLLAMA_MODELS_COUNT=$(echo "$TAGS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('models',[])))" 2>/dev/null)
+    OLLAMA_MODELS_SIZE=$(echo "$TAGS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); total=sum(m.get('size',0) for m in d.get('models',[])); print(f'{total/1024**3:.0f}GB')" 2>/dev/null)
+
+    PS_JSON=$(curl -s --connect-timeout 3 "${OLLAMA_API}/api/ps" 2>/dev/null)
+    OLLAMA_LOADED_MODELS=$(echo "$PS_JSON" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+models=d.get('models',[])
+if not models:
+    print('none')
+else:
+    print(', '.join(m['name'] for m in models))
+" 2>/dev/null)
+    OLLAMA_GPU_OFFLOAD=$(echo "$PS_JSON" | python3 -c '
+import sys,json
+d=json.load(sys.stdin)
+models=d.get("models",[])
+if not models:
+    print("idle")
+else:
+    parts=[]
+    for m in models:
+        n=m.get("name","?")
+        total=m.get("size",0)
+        vram=m.get("size_vram",0)
+        if total > 0 and vram > 0:
+            pct=vram*100//total
+            if pct >= 99:
+                parts.append(f"{n}: 100% GPU")
+            elif pct == 0:
+                parts.append(f"{n}: CPU only")
+            else:
+                parts.append(f"{n}: {pct}% GPU")
+        else:
+            parts.append(f"{n}: unknown")
+    print("; ".join(parts))
+' 2>/dev/null)
+
+    if [ -n "$OLLAMA_LXC" ]; then
+        OLLAMA_LOGS=$(pct exec "$OLLAMA_LXC" -- journalctl -u ollama --since "24 hours ago" --no-pager 2>/dev/null | grep '\[GIN\]')
+    else
+        OLLAMA_LOGS=""
+    fi
+    OLLAMA_REQ_24H=$(echo "$OLLAMA_LOGS" | grep -cE 'POST.*/api/(generate|chat)' 2>/dev/null || echo 0)
+    if [ "$OLLAMA_REQ_24H" -gt 0 ] 2>/dev/null; then
+        OLLAMA_ERR_24H=$(echo "$OLLAMA_LOGS" | grep -E 'POST.*/api/(generate|chat)' | grep -v '| 200 |' | grep -c '.' 2>/dev/null)
+    else
+        OLLAMA_ERR_24H=0
+    fi
+
+    OLLAMA_CLIENTS=$(echo "$OLLAMA_LOGS" | grep -E 'POST.*/api/(generate|chat)' | awk -F'|' '{gsub(/^ +| +$/,"",$4); print $4}' | grep -E '^[0-9]+\.' | sort | uniq -c | sort -rn | while read -r count ip; do
+        echo -n "${ip}(${count}) "
+    done)
+    OLLAMA_CLIENTS="${OLLAMA_CLIENTS% }"
+
+    OLLAMA_AVG_DURATION=$(echo "$OLLAMA_LOGS" | grep -E 'POST.*/api/(generate|chat)' | awk -F'|' '{gsub(/^ +| +$/,"",$3); gsub(/s$/,"",$3); if($3+0>0) print $3}' | awk '{s+=$1; n++} END {if(n>0) printf "%.1fs", s/n; else print "\xe2\x80\x94"}' 2>/dev/null)
+    [ -z "$OLLAMA_AVG_DURATION" ] && OLLAMA_AVG_DURATION="—"
+
+    LAST_REQ_TIME=$(echo "$OLLAMA_LOGS" | grep -E 'POST.*/api/(generate|chat)' | tail -1 | grep -oP '\d{4}/\d{2}/\d{2} - \d{2}:\d{2}:\d{2}')
+    if [ -n "$LAST_REQ_TIME" ]; then
+        LAST_TS=$(date -d "$(echo "$LAST_REQ_TIME" | sed 's|/|-|g; s| - | |')" +%s 2>/dev/null)
+        NOW_TS=$(date +%s)
+        if [ -n "$LAST_TS" ]; then
+            IDLE_SECS=$((NOW_TS - LAST_TS))
+            if [ "$IDLE_SECS" -ge 86400 ]; then
+                OLLAMA_IDLE_TIME="$((IDLE_SECS / 86400))d $((IDLE_SECS % 86400 / 3600))h"
+            elif [ "$IDLE_SECS" -ge 3600 ]; then
+                OLLAMA_IDLE_TIME="$((IDLE_SECS / 3600))h $((IDLE_SECS % 3600 / 60))m"
+            elif [ "$IDLE_SECS" -ge 60 ]; then
+                OLLAMA_IDLE_TIME="$((IDLE_SECS / 60))m"
+            else
+                OLLAMA_IDLE_TIME="${IDLE_SECS}s"
+            fi
+        fi
+    else
+        OLLAMA_IDLE_TIME="24h+ (no requests)"
+    fi
+
+    METRICS=""
+    [ -n "$OLLAMA_METRICS" ] && METRICS=$(curl -s --connect-timeout 3 "$OLLAMA_METRICS" 2>/dev/null)
+    if [ -n "$METRICS" ]; then
+        OLLAMA_TOKENS_GENERATED=$(echo "$METRICS" | awk '/^ollama_generated_tokens_total/ {s+=$2} END {printf "%.0f", s}')
+        OLLAMA_TOKENS_PROMPT=$(echo "$METRICS" | awk '/^ollama_prompt_tokens_total/ {s+=$2} END {printf "%.0f", s}')
+        OLLAMA_TOK_PER_SEC=$(echo "$METRICS" | awk '/^ollama_time_per_token_seconds_sum/ {s+=$2} /^ollama_time_per_token_seconds_count/ {c+=$2} END {if(c>0 && s>0) printf "%.1f", c/s; else print "—"}')
+    fi
+}
+check_ollama
+
+# --- Temperatures ---
+# Depends on: SMART_DATA (from check_disks)
+# Exports: TEMP_DATA, DISK_TEMP_RANGE
+check_temperatures() {
+    CPU_TEMP=$(sensors 2>/dev/null | grep 'Package id 0:' | grep -oE '\+[0-9.]+' | head -1 | tr -d '+')
+    NVME_TEMP=$(sensors 2>/dev/null | grep 'Composite:' | grep -oE '\+[0-9.]+' | head -1 | tr -d '+')
+    GPU_TEMP=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -1)
+    AMD_GPU_TEMP="" AMD_GPU_POWER="" AMD_GPU_VRAM_USED="" AMD_GPU_VRAM_TOTAL="" AMD_GPU_SLEEP=""
+    for hwmon in /sys/class/drm/card*/device/hwmon/hwmon*; do
+        [ -f "$hwmon/name" ] || continue
+        driver=$(cat "$hwmon/name" 2>/dev/null)
+        if [ "$driver" = "amdgpu" ]; then
+            card_dev=$(dirname "$hwmon" | sed 's|/hwmon$||')
+            runtime_status=$(cat "$card_dev/power/runtime_status" 2>/dev/null)
+            if [ "$runtime_status" = "suspended" ]; then
+                AMD_GPU_SLEEP="yes"
+            else
+                raw=$(cat "$hwmon/temp1_input" 2>/dev/null)
+                [ -n "$raw" ] && AMD_GPU_TEMP=$((raw / 1000))
+                if [ -f "$hwmon/power1_average" ]; then
+                    raw_pwr=$(cat "$hwmon/power1_average" 2>/dev/null)
+                    [ -n "$raw_pwr" ] && AMD_GPU_POWER=$((raw_pwr / 1000000))
+                fi
+            fi
+            if [ -f "$card_dev/mem_info_vram_used" ]; then
+                vram_used_raw=$(cat "$card_dev/mem_info_vram_used" 2>/dev/null)
+                vram_total_raw=$(cat "$card_dev/mem_info_vram_total" 2>/dev/null)
+                [ -n "$vram_used_raw" ] && AMD_GPU_VRAM_USED=$((vram_used_raw / 1048576))
+                [ -n "$vram_total_raw" ] && AMD_GPU_VRAM_TOTAL=$((vram_total_raw / 1048576))
+            fi
+            break
+        fi
+    done
+    if [ -n "$AMD_GPU_TEMP" ] && [ "$AMD_GPU_TEMP" -ge 95 ]; then
+        emit_issue CRIT "AMD GPU (R9700) at ${AMD_GPU_TEMP}°C — throttling likely"
+    elif [ -n "$AMD_GPU_TEMP" ] && [ "$AMD_GPU_TEMP" -ge 85 ]; then
+        emit_issue WARN "AMD GPU (R9700) at ${AMD_GPU_TEMP}°C — running hot"
+    fi
+    NIC_TEMP=$(sensors 2>/dev/null | grep 'MAC Temperature:' | grep -oE '\+[0-9.]+' | head -1 | tr -d '+')
+    DISK_TEMP_MIN="" DISK_TEMP_MAX=""
+    while IFS='|' read -r _disk _health temp _hours _errors; do
+        t=$(echo "$temp" | grep -oE '[0-9]+')
+        [ -z "$t" ] && continue
+        [ -z "$DISK_TEMP_MIN" ] && DISK_TEMP_MIN=$t DISK_TEMP_MAX=$t
+        [ "$t" -lt "$DISK_TEMP_MIN" ] && DISK_TEMP_MIN=$t
+        [ "$t" -gt "$DISK_TEMP_MAX" ] && DISK_TEMP_MAX=$t
+    done <<< "$(echo -e "$SMART_DATA")"
+    if [ -n "$DISK_TEMP_MIN" ]; then
+        if [ "$DISK_TEMP_MIN" -eq "$DISK_TEMP_MAX" ]; then
+            DISK_TEMP_RANGE="${DISK_TEMP_MIN}°C"
+        else
+            DISK_TEMP_RANGE="${DISK_TEMP_MIN}–${DISK_TEMP_MAX}°C"
+        fi
+    fi
+    TEMP_DATA=""
+    [ -n "$CPU_TEMP" ] && TEMP_DATA="${TEMP_DATA}CPU Package|${CPU_TEMP}°C\n"
+    [ -n "$NVME_TEMP" ] && TEMP_DATA="${TEMP_DATA}NVMe (Kingston)|${NVME_TEMP}°C\n"
+    [ -n "$GPU_TEMP" ] && TEMP_DATA="${TEMP_DATA}GPU (GTX 1660 SUPER)|${GPU_TEMP}°C\n"
+    if [ "$AMD_GPU_SLEEP" = "yes" ]; then
+        AMD_GPU_LINE="GPU (R9700)|sleep"
+        if [ -n "$AMD_GPU_VRAM_USED" ]; then
+            AMD_VRAM_G=$(awk "BEGIN {printf \"%.0f\", $AMD_GPU_VRAM_USED/1024}")
+            AMD_VRAM_T=$(awk "BEGIN {printf \"%.0f\", $AMD_GPU_VRAM_TOTAL/1024}")
+            AMD_GPU_LINE="${AMD_GPU_LINE}, ${AMD_VRAM_G}/${AMD_VRAM_T}G VRAM"
+        fi
+        TEMP_DATA="${TEMP_DATA}${AMD_GPU_LINE}\n"
+    elif [ -n "$AMD_GPU_TEMP" ]; then
+        AMD_GPU_LINE="GPU (R9700)|${AMD_GPU_TEMP}°C"
+        [ -n "$AMD_GPU_POWER" ] && AMD_GPU_LINE="${AMD_GPU_LINE}, ${AMD_GPU_POWER}W"
+        if [ -n "$AMD_GPU_VRAM_USED" ]; then
+            AMD_VRAM_G=$(awk "BEGIN {printf \"%.0f\", $AMD_GPU_VRAM_USED/1024}")
+            AMD_VRAM_T=$(awk "BEGIN {printf \"%.0f\", $AMD_GPU_VRAM_TOTAL/1024}")
+            AMD_GPU_LINE="${AMD_GPU_LINE}, ${AMD_VRAM_G}/${AMD_VRAM_T}G"
+        fi
+        TEMP_DATA="${TEMP_DATA}${AMD_GPU_LINE}\n"
+    fi
+    [ -n "$NIC_TEMP" ] && TEMP_DATA="${TEMP_DATA}10G NIC (Aquantia)|${NIC_TEMP}°C\n"
+    [ -n "$DISK_TEMP_RANGE" ] && TEMP_DATA="${TEMP_DATA}Disks|${DISK_TEMP_RANGE}\n"
+}
+check_temperatures
+
+# --- System Summary ---
+# Exports: UPTIME, LOAD, MEM_USED, PVE_VER, KERNEL_VER, UPGRADABLE_COUNT
+gather_system_summary() {
+    UPTIME=$(uptime -p)
+    LOAD=$(cat /proc/loadavg | awk '{print $1, $2, $3}')
+    MEM_USED=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
+
+    PVE_VER=$(pveversion 2>/dev/null | cut -d'/' -f2)
+    KERNEL_VER=$(uname -r)
+    LATEST_KERNEL_PKG=$(dpkg -l 'proxmox-kernel-[0-9]*' 2>/dev/null | awk '/^ii.*pve-signed/ {print $2}' | sort -V | tail -1)
+    LATEST_KERNEL_VER=$(echo "$LATEST_KERNEL_PKG" | sed 's/proxmox-kernel-//;s/-signed//')
+    if [ -n "$LATEST_KERNEL_VER" ] && [ "$LATEST_KERNEL_VER" != "$KERNEL_VER" ]; then
+        KERNEL_VER="${KERNEL_VER} (${LATEST_KERNEL_VER} available)"
+    fi
+    INSTALLED_PVE=$(dpkg -l pve-manager 2>/dev/null | awk '/^ii/{print $3}')
+    LATEST_PVE=$(apt-cache policy pve-manager 2>/dev/null | awk '/Candidate:/{print $2}')
+    if [ -n "$LATEST_PVE" ] && [ -n "$INSTALLED_PVE" ] && [ "$LATEST_PVE" != "$INSTALLED_PVE" ]; then
+        PVE_VER="${PVE_VER} (${LATEST_PVE} available)"
+    fi
+    UPGRADABLE_COUNT=$(apt-get -s dist-upgrade 2>/dev/null | grep -c ^Inst)
+}
+gather_system_summary
+
+HAS_CRIT=false
+HAS_WARN=false
+HAS_INFO=false
+for issue in "${ISSUES[@]}"; do
+    case "${issue%%|*}" in
+        CRIT) HAS_CRIT=true ;;
+        WARN) HAS_WARN=true ;;
+        INFO) HAS_INFO=true ;;
+    esac
+done
+
+if $HAS_CRIT; then
+    STATUS_ICON_TG=$(printf '\xE2\x9D\x8C')
+    STATUS_ICON_HTML="&#10060;"
+    STATUS_ICON_MD="[!!]"
+    STATUS_TEXT="${#ISSUES[@]} issue(s) detected"
+    STATUS_COLOR="#e74c3c"
+    RGB_STATUS="crit"
+elif $HAS_WARN; then
+    STATUS_ICON_TG=$(printf '\xE2\x9A\xA0\xEF\xB8\x8F')
+    STATUS_ICON_HTML="&#9888;&#65039;"
+    STATUS_ICON_MD="[!]"
+    STATUS_TEXT="${#ISSUES[@]} warning(s)"
+    STATUS_COLOR="#e67e22"
+    RGB_STATUS="warn"
+else
+    # Healthy (INFO-only counts as healthy)
+    STATUS_ICON_TG=$(printf '\xE2\x9C\x85')
+    STATUS_ICON_HTML="&#9989;"
+    STATUS_ICON_MD="[OK]"
+    STATUS_TEXT="All systems healthy"
+    STATUS_COLOR="#2ecc71"
+    RGB_STATUS="ok"
+fi
+
+# Set case RGB based on health status
+set-case-rgb "$RGB_STATUS" 2>/dev/null &
+
+# ===================== Markdown Log =====================
+
+{
+    echo ""
+    echo "---"
+    echo ""
+    echo "### ${DATE_SHORT} — ${STATUS_ICON_MD} ${STATUS_TEXT}"
+    echo ""
+    if [ ${#ISSUES[@]} -gt 0 ]; then
+        echo "**Issues:**"
+        for issue in "${ISSUES[@]}"; do
+            severity="${issue%%|*}"
+            msg="${issue#*|}"
+            echo "- **${severity}**: ${msg}"
+        done
+        echo ""
+    fi
+    echo "**Storage Pools**"
+    echo ""
+    echo "| Pool | Size | Used | Free | Cap | Health |"
+    echo "|------|------|------|------|-----|--------|"
+    echo -e "$POOL_DATA" | while IFS='|' read -r pool size alloc free cap health; do
+        [ -n "$pool" ] && echo "| $pool | $size | $alloc | $free | $cap | $health |"
+    done
+    echo ""
+    echo "**Disk Health (SMART)**"
+    echo ""
+    echo "| Disk | Status | Temp | Power-On | Errors/Realloc |"
+    echo "|------|--------|------|----------|----------------|"
+    echo -e "$SMART_DATA" | while IFS='|' read -r disk health temp hours errors; do
+        [ -n "$disk" ] && echo "| $disk | $health | $temp | $hours | $errors |"
+    done
+    echo ""
+    echo "**Virtual Machines & Containers**"
+    echo ""
+    echo "| Name | Status | Memory | Disk |"
+    echo "|------|--------|--------|------|"
+    echo -e "$GUEST_DATA" | while IFS='|' read -r name status mem disk; do
+        [ -n "$name" ] && echo "| $name | $status | $mem | $disk |"
+    done
+    if [ "$DOCKER_CRIT_COUNT" -gt 0 ]; then
+        echo ""
+        echo "**Docker Services (VM 104 + LXC 105)**"
+        echo ""
+        echo "| Service | Status |"
+        echo "|---------|--------|"
+        echo -e "$DOCKER_CRIT_DATA" | while IFS='|' read -r dname dstate; do
+            [ -n "$dname" ] && echo "| $dname | $dstate |"
+        done
+        DOCKER_STOPPED=$((DOCKER_OTHER_TOTAL - DOCKER_OTHER_RUNNING))
+        if [ "$DOCKER_STOPPED" -gt 0 ]; then
+            echo -e "$DOCKER_STOPPED_DATA" | while IFS='|' read -r sname sreason; do
+                [ -n "$sname" ] && echo "| $sname | $sreason |"
+            done
+        fi
+        echo ""
+        echo "+ ${DOCKER_OTHER_RUNNING} other running"
+    fi
+    echo ""
+    echo "**Ollama (LXC 106)**"
+    echo ""
+    if [ "$OLLAMA_OK" = "ok" ]; then
+        OLLAMA_VER_STR="v${OLLAMA_VERSION}"
+        [ -n "$OLLAMA_UPDATE_AVAIL" ] && OLLAMA_VER_STR="${OLLAMA_VER_STR} (${OLLAMA_UPDATE_AVAIL} available)"
+        echo "${OLLAMA_VER_STR} | ${OLLAMA_MODELS_COUNT} models (${OLLAMA_MODELS_SIZE}) | Loaded: ${OLLAMA_LOADED_MODELS} | GPU: ${OLLAMA_GPU_OFFLOAD}"
+        echo "24h: ${OLLAMA_REQ_24H} requests, ${OLLAMA_ERR_24H} errors, avg ${OLLAMA_AVG_DURATION} | idle ${OLLAMA_IDLE_TIME}"
+        [ -n "$OLLAMA_CLIENTS" ] && echo "Clients: ${OLLAMA_CLIENTS}"
+        echo "Tokens: ${OLLAMA_TOKENS_GENERATED} generated, ${OLLAMA_TOKENS_PROMPT} prompt | ${OLLAMA_TOK_PER_SEC} tok/s"
+    else
+        echo "NOT RESPONDING"
+    fi
+
+    echo ""
+    echo "**Maintenance**"
+    echo ""
+    echo "| Task | Last Run | Status | Details |"
+    echo "|------|----------|--------|---------|"
+    echo "| Sanoid (snapshots) | ${SANOID_LAST_FMT} | ${SANOID_STATUS_TEXT} | ${SANOID_COVERED_DS}/${SANOID_TOTAL_DS} ZFS guest datasets |"
+    echo "| Syncoid (replication) | ${SYNCOID_SVC_LAST_FMT} | ${SYNCOID_SVC_STATUS_TEXT} | z1pool/data/personal -> hdd-data |"
+    echo "| Vzdump (PVE backup) | ${VZDUMP_LAST_FMT} | Weekly | ${VZDUMP_VMIDS}/${TOTAL_GUESTS} guests |"
+    echo "| Unattended upgrades | ${UAU_LAST_FMT} | ${UAU_STATUS_TEXT} | $([ "$UAU_REBOOT_REQUIRED" = "yes" ] && echo "reboot required" || echo "—") |"
+    echo -e "$SCRUB_DATA" | while IFS='|' read -r pool scrub_time scrub_errs; do
+        [ -z "$pool" ] && continue
+        echo "| ZFS scrub ($pool) | ${scrub_time} | ${scrub_errs} | Monthly |"
+    done
+    echo ""
+    echo "**System Summary**"
+    echo ""
+    echo "Uptime: ${UPTIME#up } | Load: ${LOAD} | RAM: ${MEM_USED} | Snapshots: ${SNAP_COUNT}"
+    TEMP_LINE=""
+    while IFS='|' read -r comp temp; do
+        [ -n "$comp" ] && TEMP_LINE="${TEMP_LINE}${comp}: ${temp}, "
+    done <<< "$(echo -e "$TEMP_DATA")"
+    echo "Temps: ${TEMP_LINE%, }"
+    LXC_UPD_LINE=""
+    [ -n "$LXC_UPDATE_SUMMARY" ] && LXC_UPD_LINE=" | LXC updates: ${LXC_UPDATE_SUMMARY}"
+    echo "Kernel: ${KERNEL_VER} | PVE: ${PVE_VER} | Packages: ${UPGRADABLE_COUNT} upgradable${LXC_UPD_LINE}"
+} >> "$LOG_FILE"
+
+# ===================== Telegram =====================
+
+OK=$(printf '\xE2\x9C\x85')
+WARN_IC=$(printf '\xE2\x9A\xA0\xEF\xB8\x8F')
+FAIL=$(printf '\xE2\x9D\x8C')
+INFO_IC=$(printf '\xE2\x84\xB9\xEF\xB8\x8F')
+
+# KPI checks
+_tg_kpi() { if [ "$1" = "ok" ]; then echo "$OK $2"; else echo "$FAIL $2"; fi; }
+_tg_kpi_warn() { if [ "$1" = "ok" ]; then echo "$OK $2"; else echo "$WARN_IC $2"; fi; }
+
+# OK flags (POOL_OK/POOL_DETAIL, SMART_OK/SMART_DETAIL, GUEST_OK/GUEST_DETAIL,
+# SANOID_OK, SANOID_COV, SYNCOID_OK, CAP_OK/CAP_DETAIL) are set upstream by
+# the corresponding check_* functions.
+
+# --- Build Telegram summaries ---
+
+# Storage Pools summary
+POOL_SUMMARY=""
+while IFS='|' read -r pool size alloc free cap health; do
+    [ -z "$pool" ] && continue
+    POOL_SUMMARY="${POOL_SUMMARY}${pool}:${cap} "
+done <<< "$(echo -e "$POOL_DATA")"
+POOL_SUMMARY="${POOL_SUMMARY% }"
+if [ "$POOL_OK" != "ok" ]; then
+    POOL_SUMMARY="${POOL_SUMMARY} —${POOL_DETAIL} degraded"
+fi
+
+# SMART summary
+DISK_COUNT=0
+SMART_SUMMARY=""
+while IFS='|' read -r d h t hr e; do
+    [ -z "$d" ] && continue
+    DISK_COUNT=$((DISK_COUNT + 1))
+done <<< "$(echo -e "$SMART_DATA")"
+if [ "$SMART_OK" = "ok" ]; then
+    SMART_SUMMARY="${DISK_COUNT} disks all PASSED"
+else
+    SMART_SUMMARY="FAILED:${SMART_DETAIL}"
+fi
+
+# VMs/LXCs summary
+RUNNING_COUNT=0
+TOTAL_COUNT=0
+while IFS='|' read -r name status mem disk; do
+    [ -z "$name" ] && continue
+    TOTAL_COUNT=$((TOTAL_COUNT + 1))
+    [ "$name" = "garage-win10" ] && continue
+    [ "$status" = "running" ] && RUNNING_COUNT=$((RUNNING_COUNT + 1))
+done <<< "$(echo -e "$GUEST_DATA")"
+if [ "$GUEST_OK" = "ok" ]; then
+    GUEST_SUMMARY="${RUNNING_COUNT} running, garage-win10 stopped (expected)"
+else
+    GUEST_SUMMARY="DOWN:${GUEST_DETAIL}"
+fi
+
+# Docker summary
+if [ "$DOCKER_CRIT_COUNT" -gt 0 ]; then
+    if [ "$DOCKER_CRIT_UP" = "$DOCKER_CRIT_COUNT" ]; then
+        DOCKER_OK="ok"
+    else
+        DOCKER_OK="fail"
+    fi
+    DOCKER_STOPPED=$((DOCKER_OTHER_TOTAL - DOCKER_OTHER_RUNNING))
+    DOCKER_TG_SUMMARY="${DOCKER_CRIT_UP}/${DOCKER_CRIT_COUNT} critical up, +${DOCKER_OTHER_RUNNING} other"
+    [ "$DOCKER_STOPPED" -gt 0 ] && DOCKER_TG_SUMMARY="${DOCKER_TG_SUMMARY} (${DOCKER_STOPPED} stopped)"
+else
+    DOCKER_OK="ok"
+    DOCKER_TG_SUMMARY="VM 104 not running"
+fi
+
+# Maintenance summary (was Backups)
+if [ "$SANOID_OK" = "ok" ] && [ "$SYNCOID_OK" = "ok" ]; then
+    MAINT_OK="ok"
+else
+    MAINT_OK="fail"
+fi
+MAINT_SUMMARY="Sanoid ${SANOID_LAST_FMT}, Syncoid ${SYNCOID_SVC_LAST_FMT}, Vzdump ${VZDUMP_VMIDS}/${TOTAL_GUESTS}"
+if [ "$SANOID_COV" != "ok" ]; then
+    MAINT_SUMMARY="${MAINT_SUMMARY}, gaps ${SANOID_COVERED_DS}/${SANOID_TOTAL_DS}"
+fi
+if [ "$UAU_PKG_COUNT" -gt 0 ]; then
+    MAINT_SUMMARY="${MAINT_SUMMARY}, ${UAU_PKG_COUNT} pkgs upgraded"
+fi
+if [ "$UAU_REBOOT_REQUIRED" = "yes" ]; then
+    MAINT_SUMMARY="${MAINT_SUMMARY}, reboot needed"
+fi
+
+# Ollama summary
+if [ "$OLLAMA_OK" = "ok" ]; then
+    OLLAMA_TG_SUMMARY="${OLLAMA_MODELS_COUNT} models, ${OLLAMA_REQ_24H} req/24h, idle ${OLLAMA_IDLE_TIME}"
+    [ "$OLLAMA_GPU_OFFLOAD" != "idle" ] && OLLAMA_TG_SUMMARY="${OLLAMA_TG_SUMMARY}, ${OLLAMA_GPU_OFFLOAD}"
+else
+    OLLAMA_TG_SUMMARY="not responding"
+fi
+
+# System summary
+SYS_SUMMARY="RAM ${MEM_USED}, load ${LOAD%% *}, ${UPTIME#up }"
+
+TG_MSG="${STATUS_ICON_TG} *${HOSTNAME}* — _${DATE}_
+
+$(_tg_kpi "$POOL_OK" "Storage Pools")
+ ${POOL_SUMMARY}
+$(_tg_kpi "$SMART_OK" "Disk Health")
+ ${SMART_SUMMARY}
+$(_tg_kpi "$GUEST_OK" "VMs / Containers")
+ ${GUEST_SUMMARY}
+$(_tg_kpi "$DOCKER_OK" "Docker Services")
+ ${DOCKER_TG_SUMMARY}
+$(_tg_kpi "$OLLAMA_OK" "Ollama")
+ ${OLLAMA_TG_SUMMARY}
+$(_tg_kpi "$MAINT_OK" "Maintenance") $(_tg_kpi_warn "$SANOID_COV" "${SANOID_COVERED_DS}/${SANOID_TOTAL_DS}")
+ ${MAINT_SUMMARY}
+$(_tg_kpi_warn "$CAP_OK" "System")
+ ${SYS_SUMMARY}"
+
+if [ ${#ISSUES[@]} -gt 0 ]; then
+    TG_MSG="${TG_MSG}
+"
+    for issue in "${ISSUES[@]}"; do
+        severity="${issue%%|*}"
+        msg="${issue#*|}"
+        if [ "$severity" = "CRIT" ]; then
+            TG_MSG="${TG_MSG}
+${FAIL} ${msg}"
+        elif [ "$severity" = "INFO" ]; then
+            TG_MSG="${TG_MSG}
+${INFO_IC} ${msg}"
+        else
+            TG_MSG="${TG_MSG}
+${WARN_IC} ${msg}"
+        fi
+    done
+fi
+
+/usr/local/bin/notify-telegram "$TG_MSG"
+
+# ===================== HTML Email =====================
+
+# --- Normalize columns: detect if all values are the same ---
+ALL_SMART_PASSED=true
+ALL_ERRORS_ZERO=true
+ALL_POOLS_ONLINE=true
+while IFS='|' read -r disk health temp hours errors; do
+    [ -z "$disk" ] && continue
+    if [ "$health" != "PASSED" ] && [ "$health" != "OK" ]; then ALL_SMART_PASSED=false; fi
+    uncorr="${errors%%/*}"; realloc="${errors##*/}"
+    if [ "$uncorr" != "0" ] || [ "$realloc" != "0" ]; then ALL_ERRORS_ZERO=false; fi
+done <<< "$(echo -e "$SMART_DATA")"
+while IFS='|' read -r pool size alloc free cap health; do
+    [ -z "$pool" ] && continue
+    if [ "$health" != "ONLINE" ] && [ "$health" != "ext4" ]; then ALL_POOLS_ONLINE=false; fi
+done <<< "$(echo -e "$POOL_DATA")"
+
+# Compact uptime for header: "up 1 week, 4 days, 14 hours, 49 minutes" -> "11d 14h"
+UPTIME_SECS_TOTAL=$(awk '{print int($1)}' /proc/uptime)
+_up_d=$((UPTIME_SECS_TOTAL / 86400))
+_up_h=$(( (UPTIME_SECS_TOTAL % 86400) / 3600 ))
+_up_m=$(( (UPTIME_SECS_TOTAL % 3600) / 60 ))
+if [ "$_up_d" -gt 0 ]; then
+    UPTIME_COMPACT="up ${_up_d}d ${_up_h}h"
+elif [ "$_up_h" -gt 0 ]; then
+    UPTIME_COMPACT="up ${_up_h}h ${_up_m}m"
+else
+    UPTIME_COMPACT="up ${_up_m}m"
+fi
+
+# Shorten component names for temperatures
+TEMP_DATA_SHORT=$(echo -e "$TEMP_DATA" | sed \
+    -e 's/CPU Package/CPU/' \
+    -e 's/NVMe (Kingston)/NVMe/' \
+    -e 's/GPU (GTX 1660 SUPER)/1660S/' \
+    -e 's/GPU (R9700)/R9700/' \
+    -e 's/10G NIC (Aquantia)/10G NIC/')
+
+HTML="<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { font-family: -apple-system, 'Segoe UI', Arial, sans-serif; background: #1a1a2e; margin: 0; padding: 8px; }
+  .container { max-width: 600px; margin: 0 auto; background: #16213e; border-radius: 8px; overflow: hidden; }
+  .header { background: ${STATUS_COLOR}; color: #fff; padding: 12px; }
+  .header h1 { margin: 0; font-size: 17px; font-weight: 600; }
+  .header p { margin: 2px 0 0; opacity: 0.9; font-size: 12px; }
+  .body { padding: 8px; }
+  .section { margin-bottom: 12px; }
+  .section h2 { font-size: 11px; color: #8892b0; text-transform: uppercase; letter-spacing: 0.5px; margin: 0 0 6px; border-bottom: 1px solid #233554; padding-bottom: 4px; }
+  .note { font-size: 10px; color: #2ecc71; margin: -4px 0 4px; }
+  .note-warn { font-size: 10px; color: #e67e22; margin: -4px 0 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; color: #ccd6f6; }
+  th { text-align: left; padding: 3px 4px; font-weight: 600; color: #8892b0; font-size: 10px; border-bottom: 1px solid #233554; }
+  td { padding: 3px 4px; border-bottom: 1px solid #0a192f; }
+  .g { color: #2ecc71; }
+  .r { color: #e74c3c; font-weight: 600; }
+  .y { color: #e67e22; font-weight: 600; }
+  .dim { color: #5a6785; }
+  .badge { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 600; }
+  .badge-crit { background: #e74c3c22; color: #e74c3c; }
+  .badge-warn { background: #e67e2222; color: #e67e22; }
+  .badge-ok { background: #2ecc7122; color: #2ecc71; }
+  .badge-info { background: #3498db22; color: #3498db; }
+  .footer { padding: 6px 12px; font-size: 10px; color: #5a6785; text-align: center; }
+</style>
+</head>
+<body>
+<div class='container'>
+  <div class='header'>
+    <h1>${STATUS_ICON_HTML} ${HOSTNAME} Daily Health Report</h1>
+    <p>${DATE} | ${UPTIME_COMPACT}</p>
+  </div>
+  <div class='body'>"
+
+# Issues section
+if [ ${#ISSUES[@]} -gt 0 ]; then
+    HTML="${HTML}
+    <div class='section'><h2>Issues</h2>"
+    for issue in "${ISSUES[@]}"; do
+        severity="${issue%%|*}"
+        msg="${issue#*|}"
+        case "$severity" in
+            CRIT) badge="badge-crit" ;;
+            WARN) badge="badge-warn" ;;
+            INFO) badge="badge-info" ;;
+            *)    badge="badge-ok" ;;
+        esac
+        HTML="${HTML}<div style='margin:2px 0;font-size:11px;color:#ccd6f6'><span class='badge ${badge}'>${severity}</span> ${msg}</div>"
+    done
+    HTML="${HTML}</div>"
+fi
+
+# Storage section — drop Health column if all healthy
+HTML="${HTML}
+    <div class='section'>
+      <h2>Storage Pools</h2>"
+if $ALL_POOLS_ONLINE; then
+    HTML="${HTML}<div class='note'>&#9989; All pools healthy</div>"
+fi
+HTML="${HTML}
+      <table>
+        <tr><th>Pool</th><th>Size</th><th>Used</th><th>Free</th><th>%</th></tr>"
+HTML="${HTML}$(echo -e "$POOL_DATA" | while IFS='|' read -r pool size alloc free cap health; do
+    [ -z "$pool" ] && continue
+    cap_num=${cap%\%}
+    if [ "$cap_num" -ge 90 ]; then s="class='r'"
+    elif [ "$cap_num" -ge 80 ]; then s="class='y'"
+    else s="class='g'"
+    fi
+    echo "<tr><td><strong>${pool}</strong></td><td>${size}</td><td>${alloc}</td><td>${free}</td><td ${s}>${cap}</td></tr>"
+done)
+      </table>
+    </div>"
+
+# Disk health section — normalize SMART & errors columns
+HTML="${HTML}
+    <div class='section'>
+      <h2>Disks (SMART)</h2>"
+if $ALL_SMART_PASSED && $ALL_ERRORS_ZERO; then
+    HTML="${HTML}<div class='note'>&#9989; All disks PASSED, 0 errors</div>"
+fi
+HTML="${HTML}
+      <table>
+        <tr><th>Disk</th><th></th><th>Temp</th><th>Age</th>"
+if ! $ALL_ERRORS_ZERO; then HTML="${HTML}<th>Err</th>"; fi
+HTML="${HTML}</tr>"
+while IFS='|' read -r disk health temp hours errors; do
+    [ -z "$disk" ] && continue
+    short_disk=${disk#/dev/}
+    if [ "$health" = "PASSED" ] || [ "$health" = "OK" ]; then icon="&#128994;"
+    elif [ "$health" = "N/A" ]; then icon="&#128994;"
+    else icon="&#128308;"; fi
+    row="<tr><td>${short_disk}</td><td>${icon}</td><td>${temp}</td><td>${hours}</td>"
+    if ! $ALL_ERRORS_ZERO; then
+        uncorr="${errors%%/*}"; realloc="${errors##*/}"
+        if [ "$uncorr" = "0" ] && [ "$realloc" = "0" ]; then row="${row}<td class='g'>0</td>"
+        else row="${row}<td class='r'>${errors}</td>"; fi
+    fi
+    HTML="${HTML}${row}</tr>"
+done <<< "$(echo -e "$SMART_DATA")"
+HTML="${HTML}
+      </table>
+    </div>"
+
+# Guests section — no ID column, emoji status
+HTML="${HTML}
+    <div class='section'>
+      <h2>VMs &amp; Containers</h2>
+      <table>
+        <tr><th>Name</th><th></th><th>Mem</th><th>Disk</th></tr>"
+HTML="${HTML}$(echo -e "$GUEST_DATA" | while IFS='|' read -r name status mem disk; do
+    [ -z "$name" ] && continue
+    if [ "$status" = "running" ]; then icon="&#128994;"; else icon="&#9898;"; fi
+    echo "<tr><td>${name}</td><td>${icon}</td><td>${mem}</td><td>${disk}</td></tr>"
+done)
+      </table>
+    </div>"
+
+# Docker services section (VM 104)
+if [ "$DOCKER_CRIT_COUNT" -gt 0 ] || [ "$DOCKER_OTHER_TOTAL" -gt 0 ]; then
+    HTML="${HTML}
+    <div class='section'>
+      <h2>Docker Services (VM 104 + LXC 105)</h2>
+      <table>
+        <tr><th>Service</th><th></th></tr>"
+    while IFS='|' read -r dname dstate; do
+        [ -z "$dname" ] && continue
+        if [ "$dstate" = "running" ]; then icon="&#128994;"; else icon="&#128308;"; fi
+        HTML="${HTML}<tr><td>${dname}</td><td>${icon}</td></tr>"
+    done <<< "$(echo -e "$DOCKER_CRIT_DATA")"
+    # Stopped container details
+    DOCKER_STOPPED=$((DOCKER_OTHER_TOTAL - DOCKER_OTHER_RUNNING))
+    if [ "$DOCKER_STOPPED" -gt 0 ]; then
+        while IFS='|' read -r sname sreason; do
+            [ -z "$sname" ] && continue
+            if echo "$sreason" | grep -qE "crashed|crash loop"; then
+                icon="&#128308;"; cls="r"
+            else
+                icon="&#9898;"; cls="dim"
+            fi
+            HTML="${HTML}<tr><td class='${cls}'>${sname}</td><td>${icon} <span class='${cls}' style='font-size:10px'>${sreason}</span></td></tr>"
+        done <<< "$(echo -e "$DOCKER_STOPPED_DATA")"
+    fi
+    HTML="${HTML}
+      </table>
+      <div style='font-size:10px;color:#8892b0;margin-top:4px'>+ ${DOCKER_OTHER_RUNNING} other running</div>
+    </div>"
+fi
+
+
+# Ollama section (LXC 106)
+if [ "$OLLAMA_OK" = "ok" ]; then
+    # GPU offload styling
+    case "$OLLAMA_GPU_OFFLOAD" in
+        *"100% GPU"*) GPU_CLS="g" ;;
+        *"CPU only"*) GPU_CLS="r" ;;
+        "idle")       GPU_CLS="dim" ;;
+        *)            GPU_CLS="y" ;;
+    esac
+    # Error rate styling
+    if [ "$OLLAMA_ERR_24H" -gt 0 ] 2>/dev/null; then
+        ERR_CLS="r"
+    else
+        ERR_CLS="g"
+    fi
+    HTML="${HTML}
+    <div class='section'>
+      <h2>Ollama (LXC 106)</h2>
+      <table>
+        <tr><td><strong>Version</strong></td><td>${OLLAMA_VERSION}$([ -n "$OLLAMA_UPDATE_AVAIL" ] && echo " <span class='y'>(${OLLAMA_UPDATE_AVAIL} available)</span>")</td></tr>
+        <tr><td><strong>Models</strong></td><td>${OLLAMA_MODELS_COUNT} installed (${OLLAMA_MODELS_SIZE})</td></tr>
+        <tr><td><strong>Loaded</strong></td><td>${OLLAMA_LOADED_MODELS}</td></tr>
+        <tr><td><strong>GPU Offload</strong></td><td><span class='${GPU_CLS}'>${OLLAMA_GPU_OFFLOAD}</span></td></tr>
+        <tr><td><strong>Requests (24h)</strong></td><td>${OLLAMA_REQ_24H} (<span class='${ERR_CLS}'>${OLLAMA_ERR_24H} errors</span>)</td></tr>
+        <tr><td><strong>Avg Duration</strong></td><td>${OLLAMA_AVG_DURATION}</td></tr>
+        <tr><td><strong>Idle</strong></td><td>${OLLAMA_IDLE_TIME}</td></tr>"
+    [ -n "$OLLAMA_CLIENTS" ] && HTML="${HTML}
+        <tr><td><strong>Clients</strong></td><td>${OLLAMA_CLIENTS}</td></tr>"
+    if [ "$OLLAMA_TOKENS_GENERATED" != "0" ] || [ "$OLLAMA_TOKENS_PROMPT" != "0" ]; then
+        HTML="${HTML}
+        <tr><td><strong>Tokens</strong></td><td>${OLLAMA_TOKENS_GENERATED} out / ${OLLAMA_TOKENS_PROMPT} in</td></tr>
+        <tr><td><strong>Throughput</strong></td><td>${OLLAMA_TOK_PER_SEC} tok/s</td></tr>"
+    fi
+    HTML="${HTML}
+      </table>
+    </div>"
+else
+    HTML="${HTML}
+    <div class='section'>
+      <h2>Ollama (LXC 106)</h2>
+      <div style='font-size:11px;color:#e74c3c'>&#10060; Not responding</div>
+    </div>"
+fi
+
+# Maintenance section — compact two-column layout
+if [ "$SANOID_COVERED_DS" = "$SANOID_TOTAL_DS" ]; then
+    COV_CLS="g"
+else
+    COV_CLS="y"
+fi
+if [ "$VZDUMP_VMIDS" = "$TOTAL_GUESTS" ]; then
+    VZDUMP_CLS="g"
+else
+    VZDUMP_CLS="y"
+fi
+
+# Unattended-upgrades detail for HTML
+UAU_DETAIL=""
+if [ "$UAU_REBOOT_REQUIRED" = "yes" ]; then
+    UAU_DETAIL=" <span class='badge badge-warn'>reboot</span>"
+elif [ "$UAU_PKG_COUNT" -gt 0 ]; then
+    UAU_DETAIL=" (${UAU_PKG_COUNT} pkgs)"
+fi
+
+# Status emoji helper
+_html_status_icon() {
+    if [ "$1" = "ok" ] || [ "$1" = "OK" ] || [ "$1" = "0" ]; then echo "&#9989;"; else echo "&#10060;"; fi
+}
+
+HTML="${HTML}
+    <div class='section'>
+      <h2>Maintenance</h2>
+      <table>
+        <tr><th>Task</th><th>Last</th><th></th></tr>
+        <tr><td>Sanoid</td><td>${SANOID_LAST_FMT}</td><td>$(_html_status_icon "$SANOID_LAST_EXIT") <span class='${COV_CLS}'>${SANOID_COVERED_DS}/${SANOID_TOTAL_DS}</span></td></tr>
+        <tr><td>Syncoid</td><td>${SYNCOID_SVC_LAST_FMT}</td><td>$(_html_status_icon "$SYNCOID_SVC_LAST_EXIT")</td></tr>
+        <tr><td>Vzdump</td><td>${VZDUMP_LAST_FMT}</td><td>&#9989; <span class='${VZDUMP_CLS}'>${VZDUMP_VMIDS}/${TOTAL_GUESTS}</span> weekly</td></tr>
+        <tr><td>Upgrades</td><td>${UAU_LAST_FMT}</td><td>$(_html_status_icon "$UAU_LAST_EXIT")${UAU_DETAIL}</td></tr>"
+
+# ZFS scrub rows
+HTML="${HTML}$(echo -e "$SCRUB_DATA" | while IFS='|' read -r pool scrub_time scrub_errs; do
+    [ -z "$pool" ] && continue
+    if [ "$scrub_errs" = "0 errors" ] || [ "$scrub_errs" = "—" ]; then
+        eicon="&#9989;"
+    else
+        eicon="&#10060;"
+    fi
+    echo "        <tr><td>Scrub (${pool})</td><td>${scrub_time}</td><td>${eicon}</td></tr>"
+done)
+      </table>
+    </div>"
+
+# Temperatures — compact inline layout
+TEMP_ITEMS=""
+while IFS='|' read -r comp temp; do
+    [ -z "$comp" ] && continue
+    if [ -n "$TEMP_ITEMS" ]; then
+        TEMP_ITEMS="${TEMP_ITEMS} <span style='color:#5a6785'>&middot;</span> "
+    fi
+    TEMP_ITEMS="${TEMP_ITEMS}<strong>${comp}</strong> ${temp}"
+done <<< "$(echo -e "$TEMP_DATA_SHORT")"
+
+HTML="${HTML}
+    <div class='section'>
+      <h2>Temperatures</h2>
+      <div style='font-size:11px;color:#ccd6f6;line-height:1.8'>${TEMP_ITEMS}</div>
+    </div>"
+
+# System summary — compact key-value pairs
+CPU_MODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)
+CPU_USAGE=$(awk '{printf "%.0f%%", ($1/'"$(nproc)"')*100}' /proc/loadavg)
+
+HTML="${HTML}
+    <div class='section'>
+      <h2>System</h2>
+      <div style='font-size:11px;color:#ccd6f6;line-height:1.8'>
+        <strong>PVE</strong> ${PVE_VER}<span style='color:#5a6785'> &middot; </span><strong>Kernel</strong> ${KERNEL_VER}<span style='color:#5a6785'> &middot; </span><strong>Pkgs</strong> ${UPGRADABLE_COUNT} upgradable<span style='color:#5a6785'> &middot; </span><strong>Load</strong> ${LOAD}<span style='color:#5a6785'> &middot; </span><strong>RAM</strong> ${MEM_USED}<span style='color:#5a6785'> &middot; </span><strong>CPU</strong> ${CPU_USAGE}$([ -n "$LXC_UPDATE_SUMMARY" ] && echo "<br/><strong>LXC updates</strong> <span class='y'>${LXC_UPDATE_SUMMARY}</span>")
+      </div>
+    </div>"
+
+HTML="${HTML}
+  </div>
+  <div class='footer'>
+    ${HOSTNAME} &bull; daily-health-report
+  </div>
+</div>
+</body>
+</html>"
+
+echo "$HTML" | mail -a "Content-Type: text/html; charset=UTF-8" -a "From: ${MAIL_FROM}" -s "[${HOSTNAME}] Daily Health: ${STATUS_TEXT}" root

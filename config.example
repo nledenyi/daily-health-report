@@ -1,0 +1,79 @@
+# daily-health-report configuration
+# Sourced by /usr/local/bin/daily-health-report at startup.
+# Install this file to /etc/daily-health/config (mode 0644) and edit as needed.
+
+# ===== Identity =====
+# PVE node name — used to find /etc/pve/nodes/<name>/qemu-server/ and lxc/ configs.
+# Default to `hostname`; override if your PVE node name differs.
+PVE_NODE="${PVE_NODE:-$(hostname)}"
+
+# Output directory for the appended markdown log. The directory is created if missing.
+LOG_DIR="/var/log/daily-health"
+
+# Email "From:" header. Must match your postfix/msmtp sender config.
+MAIL_FROM="Proxmox <root@$(hostname -f 2>/dev/null || hostname)>"
+
+# ===== Service endpoints =====
+# Home Assistant API (leave empty to skip). Expected 200/401/403.
+HA_URL="http://192.168.1.10:8123/api/"
+
+# Ollama (leave OLLAMA_API empty to skip the entire Ollama section)
+OLLAMA_API="http://192.168.1.20:11434"
+OLLAMA_METRICS="http://192.168.1.20:11435/metrics"   # optional prometheus proxy
+
+# Syncthing — set to "" to skip. API key is read from the config XML at runtime.
+SYNCTHING_URL=""                                      # e.g. http://192.168.1.30:8384
+SYNCTHING_CONFIG_XML="/var/lib/syncthing/config.xml"
+
+# ===== Storage =====
+# Regex of ZFS pool names whose datasets should be sanoid-coverage checked.
+# Pools not matching this are skipped (typically rpool, backup-only pools, etc.).
+ZFS_POOLS_REGEX="(rpool|tank)"
+
+# Dataset replicated by syncoid.service. Empty = skip syncoid-replication age check.
+SYNCOID_DATASET="tank/important"
+
+# vzdump backup log glob. Default is the standard PVE location.
+VZDUMP_LOG_GLOB="/var/lib/vz/dump/*.log"
+
+# ===== Guests =====
+# VMIDs to include in the VM table. LXCs are auto-discovered via `pct list`.
+VM_IDS=(100 101 102)
+
+# VMs that are *expected* to be stopped (e.g. on-demand Windows VMs) — excluded
+# from "should be running" CRIT alerts and from the telegram OK-flag computation.
+VM_EXPECTED_STOPPED=(100)
+
+# VMs running Home Assistant OS — use /mnt/data for the disk check (HASS OS layout).
+HASS_OS_VM_IDS=(101)
+
+# ===== Service probes (empty = skip) =====
+POSTGRES_LXC=""         # e.g. 103 — runs pg_isready inside the LXC
+DOCKER_VM=""            # e.g. 104 — main Docker host VM
+DOCKER_IN_LXC=""        # e.g. 105 — docker-in-LXC (Frigate etc.)
+OLLAMA_LXC=""           # e.g. 106 — LXC that hosts the Ollama process
+
+# ===== GPU cgroup check =====
+# Dynamic-major mismatch detection after kernel/driver upgrades.
+# These LXCs should have the current nvidia-uvm / kfd major numbers in their
+# lxc.cgroup2.devices.allow lines. Empty = skip the check.
+NVIDIA_UVM_LXCS=()       # e.g. (102 105)
+AMD_KFD_LXCS=()          # e.g. (106)
+
+# ===== Docker containers =====
+# Bash glob patterns of critical container names — down = CRIT. Case patterns.
+DOCKER_CRITICAL_PATTERNS=("traefik*" "cloudflared*" "tailscale*")
+# Sub-patterns matched WITHIN critical parent names that should NOT count as critical
+# (e.g. an authentik-postgresql sidecar is not itself infra-critical):
+DOCKER_CRITICAL_EXCLUDE=("*-postgresql*" "*-redis*" "*-db*")
+
+# ===== Expected disks =====
+# SMART-monitored disks whose absence should raise CRIT. Serial -> description.
+# Leave empty to disable missing-disk detection.
+declare -gA EXPECTED_DISKS=(
+    # ["S12345EXAMPLE"]="Samsung 860 EVO 500GB (boot)"
+    # ["WDABC12345"]="WD Red 8TB (tank)"
+)
+
+# ===== Ollama release check (optional) =====
+OLLAMA_RELEASES_API="https://api.github.com/repos/ollama/ollama/releases/latest"
