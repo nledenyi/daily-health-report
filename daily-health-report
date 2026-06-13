@@ -340,6 +340,7 @@ check_guests() {
             fi
             DISK_INFO=$(echo "$DISK_RAW" | python3 -c "import sys,json; d=json.load(sys.stdin); lines=d.get('out-data','').strip().split('\n'); parts=lines[-1].split() if len(lines)>1 else []; print(f'{parts[2]}/{parts[1]}') if len(parts)>=4 else print('?/?')" 2>/dev/null)
             DISK_PCT=$(echo "$DISK_RAW" | python3 -c "import sys,json; d=json.load(sys.stdin); lines=d.get('out-data','').strip().split('\n'); parts=lines[-1].split() if len(lines)>1 else []; pct=parts[4].rstrip('%') if len(parts)>=5 else '0'; print(pct)" 2>/dev/null)
+            [ -n "$DISK_PCT" ] && [ "$DISK_INFO" != "?/?" ] && DISK_INFO="${DISK_INFO} (${DISK_PCT}%)"
             if [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge 95 ] 2>/dev/null; then
                 emit_issue CRIT "VM $vmid ($NAME) disk at ${DISK_PCT}%"
             elif [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge 85 ] 2>/dev/null; then
@@ -377,6 +378,7 @@ check_guests() {
             fi
             DISK_INFO=$(pct exec $ctid -- df -h / 2>/dev/null | awk 'NR==2 {print $3"/"$2}')
             DISK_PCT=$(pct exec $ctid -- df / 2>/dev/null | awk 'NR==2 {gsub(/%/,""); print $5}')
+            [ -n "$DISK_PCT" ] && [ -n "$DISK_INFO" ] && DISK_INFO="${DISK_INFO} (${DISK_PCT}%)"
             if [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge 95 ] 2>/dev/null; then
                 emit_issue CRIT "LXC $ctid ($NAME) disk at ${DISK_PCT}%"
             elif [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge 85 ] 2>/dev/null; then
@@ -518,6 +520,50 @@ check_services() {
             emit_issue CRIT "Home Assistant not responding (HTTP ${ha_http:-timeout})"
         fi
     fi
+    # HA Assist (Ollama conversation agent) — catches the layer where Ollama is healthy
+    # but the HA integration has drifted (e.g. LXC IP changed, model removed).
+    # Silently skipped if HA_TOKEN unset.
+    if [ -n "$HA_URL" ] && [ -n "$HA_TOKEN" ]; then
+        local base="${HA_URL%/}"
+        local entity="${HA_ASSIST_ENTITY:-conversation.ollama_conversation}"
+        HA_TOKEN="$HA_TOKEN" HA_BASE="$base" HA_ENTITY="$entity" python3 - <<'PYEOF' | while IFS= read -r line; do [ -n "$line" ] && ISSUES+=("$line"); done
+import os, json, urllib.request
+
+base = os.environ["HA_BASE"]
+hdr = {"Authorization": f"Bearer {os.environ['HA_TOKEN']}"}
+
+def get(path):
+    r = urllib.request.Request(base + path, headers=hdr)
+    return json.loads(urllib.request.urlopen(r, timeout=8).read())
+
+try:
+    entries = get("/config/config_entries/entry?domain=ollama")
+    if not entries:
+        print("WARN|HA Ollama integration not configured")
+    else:
+        for e in entries:
+            st = e.get("state", "?")
+            if st in ("setup_error", "setup_retry", "migration_error", "failed_unload"):
+                print(f"CRIT|HA Ollama integration in state '{st}' (entry {e.get('title','?')})")
+            elif st != "loaded":
+                print(f"WARN|HA Ollama integration in state '{st}'")
+except Exception as ex:
+    print(f"WARN|HA Ollama integration check failed: {type(ex).__name__}")
+
+try:
+    s = get(f"/states/{os.environ['HA_ENTITY']}")
+    state = s.get("state", "?")
+    if state == "unavailable":
+        print(f"CRIT|HA conversation entity {os.environ['HA_ENTITY']} is unavailable")
+except urllib.error.HTTPError as ex:
+    if ex.code == 404:
+        print(f"WARN|HA conversation entity {os.environ['HA_ENTITY']} not found")
+    else:
+        print(f"WARN|HA conversation entity check failed: HTTP {ex.code}")
+except Exception as ex:
+    print(f"WARN|HA conversation entity check failed: {type(ex).__name__}")
+PYEOF
+    fi
     if [ -n "$POSTGRES_LXC" ] && pct status "$POSTGRES_LXC" 2>/dev/null | grep -q running; then
         pg_ready=$(pct exec "$POSTGRES_LXC" -- pg_isready 2>&1)
         if ! echo "$pg_ready" | grep -q "accepting connections"; then
@@ -532,6 +578,37 @@ check_services() {
     fi
 }
 check_services
+
+# Samba - server-side regression detector. Catches smbd/nmbd crashes, port not
+# listening, or a share name disappearing from the advertised list (e.g. typo
+# in smb.conf after edit, path no longer exists). Skipped if SAMBA_SHARES empty.
+check_samba() {
+    [ -z "${SAMBA_SHARES[*]}" ] && return
+    if ! systemctl is-active --quiet smbd; then
+        emit_issue CRIT "smbd not active"
+        return
+    fi
+    if ! systemctl is-active --quiet nmbd; then
+        emit_issue WARN "nmbd not active"
+    fi
+    if ! ss -tln 2>/dev/null | grep -qE ':445\b'; then
+        emit_issue CRIT "Samba TCP 445 not listening"
+        return
+    fi
+    local advertised
+    advertised=$(timeout 5 smbclient -L //localhost -U% 2>/dev/null | awk '/Disk/ {print $1}')
+    if [ -z "$advertised" ]; then
+        emit_issue WARN "smbclient -L //localhost returned no shares"
+        return
+    fi
+    local share
+    for share in "${SAMBA_SHARES[@]}"; do
+        if ! grep -qx "$share" <<< "$advertised"; then
+            emit_issue WARN "Samba share '${share}' not advertised"
+        fi
+    done
+}
+check_samba
 
 # GPU cgroup major number mismatch (dynamic majors shift across reboots)
 check_gpu_cgroup_majors() {
@@ -587,6 +664,40 @@ check_claude_remote() {
 }
 check_claude_remote
 
+# Claude Code session-transcripts backup (rsync mirror to ZFS-backed pool, cron 02:45)
+check_claude_projects_backup() {
+    local sentinel=/var/log/claude-projects-backup.last-success
+    if [ ! -f "$sentinel" ]; then
+        emit_issue CRIT "claude-projects backup sentinel missing — has the cron ever succeeded?"
+        return
+    fi
+    local age_h=$(( ( $(date +%s) - $(stat -c '%Y' "$sentinel") ) / 3600 ))
+    if [ "$age_h" -gt 36 ]; then
+        emit_issue CRIT "claude-projects backup last succeeded ${age_h}h ago"
+    elif [ "$age_h" -gt 26 ]; then
+        emit_issue WARN "claude-projects backup last succeeded ${age_h}h ago"
+    fi
+}
+check_claude_projects_backup
+
+# ApoHome Postgres logical backup (LXC 103 -> z1pool, apohome-db-backup.timer 03:30)
+check_apohome_db_backup() {
+    local dir=/z1pool/data/backups/apohome-db
+    local newest
+    newest=$(ls -t "$dir"/apohome-*.sql.gz 2>/dev/null | head -1)
+    if [ -z "$newest" ]; then
+        emit_issue CRIT "apohome DB backup missing — no dump in $dir"
+        return
+    fi
+    local age_h=$(( ( $(date +%s) - $(stat -c '%Y' "$newest") ) / 3600 ))
+    if [ "$age_h" -gt 36 ]; then
+        emit_issue CRIT "apohome DB backup last succeeded ${age_h}h ago"
+    elif [ "$age_h" -gt 25 ]; then
+        emit_issue WARN "apohome DB backup last succeeded ${age_h}h ago"
+    fi
+}
+check_apohome_db_backup
+
 # Syncthing (shared Docker container behind the PVE node or on the Docker VM)
 # Skipped entirely unless both a URL can be resolved and the config XML is readable.
 _st_url="${SYNCTHING_URL}"
@@ -596,7 +707,7 @@ if [ -n "$_st_url" ] && [ -r "$SYNCTHING_CONFIG_XML" ]; then
     if [ -n "$ST_APIKEY" ]; then
         while IFS= read -r line; do
             [ -n "$line" ] && ISSUES+=("$line")
-        done < <(ST_APIKEY="$ST_APIKEY" ST_URL="$_st_url" python3 - <<'PYEOF'
+        done < <(ST_APIKEY="$ST_APIKEY" ST_URL="$_st_url" SYNCTHING_IGNORE_PEERS="$SYNCTHING_IGNORE_PEERS" python3 - <<'PYEOF'
 import os, sys, json, urllib.request
 from datetime import datetime, timezone
 
@@ -633,6 +744,7 @@ except Exception:
     pass
 
 try:
+    ignore = {n.strip() for n in os.environ.get('SYNCTHING_IGNORE_PEERS', '').split(',') if n.strip()}
     devices = {d['deviceID']: d['name'] for d in get('/rest/config/devices')}
     conns = get('/rest/system/connections').get('connections', {})
     stats = get('/rest/stats/device')
@@ -641,6 +753,8 @@ try:
         if info.get('connected') or info.get('paused'):
             continue
         name = devices.get(dev_id, dev_id[:8])
+        if name in ignore:
+            continue
         last = (stats.get(dev_id) or {}).get('lastSeen') or info.get('lastSeen') or ''
         if not last or last.startswith('0001'):
             print(f"WARN|Syncthing peer '{name}' has never connected")
