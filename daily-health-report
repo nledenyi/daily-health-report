@@ -324,6 +324,14 @@ check_guests() {
         NAME=$(qm config $vmid 2>/dev/null | grep '^name:' | awk '{print $2}')
         MEM_TOTAL=$(qm config $vmid 2>/dev/null | grep '^memory:' | awk '{print $2}')
         if [ "$STATUS" = "running" ]; then
+            # QEMU guest agent liveness: if the VM is configured for the agent
+            # (agent: enabled=1) but the in-guest daemon isn't answering, then
+            # qm guest exec (our deploy path), fs-freeze quiesced backups and
+            # graceful shutdown all silently break while the VM looks healthy.
+            if qm config $vmid 2>/dev/null | grep '^agent:' | grep -q 'enabled=1' \
+               && ! qm agent $vmid ping >/dev/null 2>&1; then
+                emit_issue WARN "VM $vmid ($NAME) QEMU guest agent not responding (enabled but down - breaks deploys/backups/graceful shutdown)"
+            fi
             MEM_USED_MB=$(qm guest exec $vmid -- free -m 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); lines=d.get('out-data','').split('\n'); mem=[l for l in lines if l.startswith('Mem:')]; print(mem[0].split()[2]) if mem else print(0)" 2>/dev/null)
             MEM_USED_MB=${MEM_USED_MB:-0}
             if [ "$MEM_TOTAL" -ge 1024 ]; then
