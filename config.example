@@ -38,8 +38,13 @@ SYNCTHING_IGNORE_PEERS=""                             # comma-separated peer nam
 # Pools not matching this are skipped (typically rpool, backup-only pools, etc.).
 ZFS_POOLS_REGEX="(rpool|tank)"
 
-# Dataset replicated by syncoid.service. Empty = skip syncoid-replication age check.
+# Dataset replicated by syncoid. Empty = skip syncoid-replication age check.
 SYNCOID_DATASET="tank/important"
+# systemd unit for the syncoid replication run (checked for last exit status).
+# Empty = skip the service-status row (still shows as OK/neutral).
+SYNCOID_SERVICE="syncoid.service"
+# Human label for the replication row in the report. Empty = use SYNCOID_DATASET.
+SYNCOID_LABEL=""                                     # e.g. "tank/important -> backup"
 
 # vzdump backup log glob. Default is the standard PVE location.
 VZDUMP_LOG_GLOB="/var/lib/vz/dump/*.log"
@@ -48,6 +53,15 @@ VZDUMP_LOG_GLOB="/var/lib/vz/dump/*.log"
 # this many hours on the job's storage (catches silently-skipped guests when
 # the per-job email is disabled). 0 or empty = skip the freshness check.
 VZDUMP_MAX_AGE_H=192    # 8 days, for a weekly schedule
+
+# Custom file-freshness checks for cron/timer backups whose only signal is a
+# sentinel or dump file. Each entry: "Label|path_or_glob|warn_hours|crit_hours".
+# A glob selects the newest match; a plain path is used directly; a missing file
+# (or no glob match) is CRIT. Empty array = no custom checks.
+FRESHNESS_CHECKS=(
+    # "Transcripts backup|/var/log/my-backup.last-success|26|36"
+    # "App DB dump|/tank/backups/appdb/app-*.sql.gz|25|36"
+)
 
 # ===== Guests =====
 # VMIDs to include in the VM table. LXCs are auto-discovered via `pct list`.

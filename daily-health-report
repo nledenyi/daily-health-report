@@ -275,8 +275,13 @@ check_sanoid_service
 # --- Syncoid Service Status ---
 # Exports: SYNCOID_SVC_LAST_FMT, SYNCOID_SVC_LAST_EXIT, SYNCOID_SVC_STATUS_TEXT, SYNCOID_SVC_STATUS_COLOR
 check_syncoid_service() {
-    SYNCOID_SVC_LAST_RUN=$(systemctl show syncoid-personal.service --property=ExecMainStartTimestamp --value 2>/dev/null)
-    SYNCOID_SVC_LAST_EXIT=$(systemctl show syncoid-personal.service --property=ExecMainStatus --value 2>/dev/null)
+    if [ -z "$SYNCOID_SERVICE" ]; then
+        SYNCOID_SVC_LAST_FMT="—"; SYNCOID_SVC_LAST_EXIT="0"
+        SYNCOID_SVC_STATUS_TEXT="skipped"; SYNCOID_OK="ok"
+        return
+    fi
+    SYNCOID_SVC_LAST_RUN=$(systemctl show "$SYNCOID_SERVICE" --property=ExecMainStartTimestamp --value 2>/dev/null)
+    SYNCOID_SVC_LAST_EXIT=$(systemctl show "$SYNCOID_SERVICE" --property=ExecMainStatus --value 2>/dev/null)
     SYNCOID_SVC_LAST_FMT=$(time_ago "$SYNCOID_SVC_LAST_RUN")
     if [ "$SYNCOID_SVC_LAST_EXIT" = "0" ]; then
         SYNCOID_SVC_STATUS_TEXT="OK"
@@ -690,8 +695,8 @@ check_gpu_cgroup_majors() {
 }
 check_gpu_cgroup_majors
 # TLS certificate expiry (check from Docker VM)
-if [ -n "$DOCKER_PS" ]; then
-    DOCKER_VM_IP=$(qm guest exec 104 -- hostname -I 2>/dev/null | \
+if [ -n "$DOCKER_VM" ]; then
+    DOCKER_VM_IP=$(qm guest exec "$DOCKER_VM" -- hostname -I 2>/dev/null | \
         python3 -c "import sys,json; d=json.load(sys.stdin); ips=d.get('out-data','').strip().split(); print(ips[0] if ips else '')" 2>/dev/null)
     if [ -n "$DOCKER_VM_IP" ]; then
         CERT_END=$(echo | openssl s_client -connect "${DOCKER_VM_IP}:443" 2>/dev/null | \
@@ -718,39 +723,29 @@ check_claude_remote() {
 }
 check_claude_remote
 
-# Claude Code session-transcripts backup (rsync mirror to ZFS-backed pool, cron 02:45)
-check_claude_projects_backup() {
-    local sentinel=/var/log/claude-projects-backup.last-success
-    if [ ! -f "$sentinel" ]; then
-        emit_issue CRIT "claude-projects backup sentinel missing — has the cron ever succeeded?"
-        return
-    fi
-    local age_h=$(( ( $(date +%s) - $(stat -c '%Y' "$sentinel") ) / 3600 ))
-    if [ "$age_h" -gt 36 ]; then
-        emit_issue CRIT "claude-projects backup last succeeded ${age_h}h ago"
-    elif [ "$age_h" -gt 26 ]; then
-        emit_issue WARN "claude-projects backup last succeeded ${age_h}h ago"
-    fi
+# Custom file-freshness checks (config-driven). Each FRESHNESS_CHECKS entry is
+# "Label|path_or_glob|warn_hours|crit_hours": a glob selects the newest match,
+# a plain path is used directly, a missing file (or no glob match) is CRIT.
+# Handy for cron/timer backups whose only signal is a sentinel or dump file.
+check_freshness() {
+    local entry label target warn_h crit_h newest age_h
+    for entry in "${FRESHNESS_CHECKS[@]}"; do
+        IFS='|' read -r label target warn_h crit_h <<< "$entry"
+        [ -z "$label" ] && continue
+        newest=$(ls -t $target 2>/dev/null | head -1)
+        if [ -z "$newest" ]; then
+            emit_issue CRIT "${label}: no file found (${target})"
+            continue
+        fi
+        age_h=$(( ( $(date +%s) - $(stat -c '%Y' "$newest") ) / 3600 ))
+        if [ "$age_h" -gt "$crit_h" ]; then
+            emit_issue CRIT "${label}: last updated ${age_h}h ago"
+        elif [ "$age_h" -gt "$warn_h" ]; then
+            emit_issue WARN "${label}: last updated ${age_h}h ago"
+        fi
+    done
 }
-check_claude_projects_backup
-
-# ApoHome Postgres logical backup (LXC 103 -> z1pool, apohome-db-backup.timer 03:30)
-check_apohome_db_backup() {
-    local dir=/z1pool/data/backups/apohome-db
-    local newest
-    newest=$(ls -t "$dir"/apohome-*.sql.gz 2>/dev/null | head -1)
-    if [ -z "$newest" ]; then
-        emit_issue CRIT "apohome DB backup missing — no dump in $dir"
-        return
-    fi
-    local age_h=$(( ( $(date +%s) - $(stat -c '%Y' "$newest") ) / 3600 ))
-    if [ "$age_h" -gt 36 ]; then
-        emit_issue CRIT "apohome DB backup last succeeded ${age_h}h ago"
-    elif [ "$age_h" -gt 25 ]; then
-        emit_issue WARN "apohome DB backup last succeeded ${age_h}h ago"
-    fi
-}
-check_apohome_db_backup
+check_freshness
 
 # Syncthing (shared Docker container behind the PVE node or on the Docker VM)
 # Skipped entirely unless both a URL can be resolved and the config XML is readable.
@@ -1285,7 +1280,7 @@ set-case-rgb "$RGB_STATUS" 2>/dev/null &
     echo "| Task | Last Run | Status | Details |"
     echo "|------|----------|--------|---------|"
     echo "| Sanoid (snapshots) | ${SANOID_LAST_FMT} | ${SANOID_STATUS_TEXT} | ${SANOID_COVERED_DS}/${SANOID_TOTAL_DS} ZFS guest datasets |"
-    echo "| Syncoid (replication) | ${SYNCOID_SVC_LAST_FMT} | ${SYNCOID_SVC_STATUS_TEXT} | z1pool/data/personal -> hdd-data |"
+    echo "| Syncoid (replication) | ${SYNCOID_SVC_LAST_FMT} | ${SYNCOID_SVC_STATUS_TEXT} | ${SYNCOID_LABEL:-${SYNCOID_DATASET:-—}} |"
     echo "| Vzdump (PVE backup) | ${VZDUMP_LAST_FMT} | Weekly | ${VZDUMP_VMIDS}/${TOTAL_GUESTS} guests |"
     echo "| Unattended upgrades | ${UAU_LAST_FMT} | ${UAU_STATUS_TEXT} | $([ "$UAU_REBOOT_REQUIRED" = "yes" ] && echo "reboot required" || echo "—") |"
     echo -e "$SCRUB_DATA" | while IFS='|' read -r pool scrub_time scrub_errs; do
