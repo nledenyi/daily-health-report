@@ -17,17 +17,18 @@ Designed to be **boring**: no daemons, no databases, no agents, no UI. A single 
 | ZFS pools + pve-root FS | health, capacity thresholds (80/90/85/95%) |
 | Disks (SMART) | health status, temperature, hours, uncorrectable errors, reallocated sectors, **missing-disk detection by serial number** |
 | ZFS replication | sanoid snapshot coverage across VM/LXC datasets, sanoid+syncoid service exit status, syncoid dataset age |
-| Proxmox backups | vzdump coverage (jobs × guests), last-backup age |
+| Proxmox backups | vzdump coverage (jobs × guests), last-backup age, last-run task status (CRIT on errors), per-guest backup freshness against `VZDUMP_MAX_AGE_H` |
 | Guests | VM and LXC status, memory, disk %, pending `apt` updates, HASS OS special-case (`/mnt/data` instead of `/`) |
 | Postfix | deferred mail queue |
 | Docker | container health across a Docker VM and a docker-in-LXC, configurable critical-container patterns (CRIT on down) and non-critical ones (WARN on unhealthy/crash) |
 | Service health | Home Assistant API, PostgreSQL (via `pg_isready` in LXC), NVIDIA/AMD GPU driver presence, **LXC GPU cgroup major-number mismatches** (catches silent breakage after kernel/driver upgrades) |
+| Samba | `smbd`/`nmbd` active, TCP 445 listening, each configured share name still advertised by `smbclient -L //localhost` |
 | TLS | certificate expiry on the Docker host's 443 |
 | Syncthing | API reachability, per-folder pull errors, peer offline > 24h |
 | `claude-remote.service` | systemd active + `claude remote-control` process alive |
 | Updates | `unattended-upgrades` status, reboot-required flag, package NEWS, PVE + kernel available-update detection |
 | ZFS scrub | last-run + errors per pool |
-| Ollama | version + GitHub release check, models, GPU offload, request count + errors over 24h, tokens, tok/s, idle time |
+| Ollama | version + GitHub release check (minor/major bumps WARN; patch releases auto-applied via optional `OLLAMA_UPGRADE_HOOK`), models, GPU offload, request count + errors over 24h, tokens, tok/s, idle time |
 | Temperatures | CPU, NVMe, NVIDIA GPU, AMD GPU (+ VRAM + sleep state), 10G NIC, disk min-max |
 | System summary | uptime, load, RAM, PVE + kernel versions, upgradable-package count, LXC update roll-up |
 

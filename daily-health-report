@@ -311,6 +311,52 @@ print(len(vmids))
     else
         VZDUMP_LAST_FMT="Never"
     fi
+
+    # Last-run status: with per-job emails disabled, this report is the only
+    # place a failed vzdump run surfaces.
+    local last_status
+    last_status=$(pvesh get "/nodes/${PVE_NODE}/tasks" --typefilter vzdump --limit 5 --output-format json 2>/dev/null | python3 -c "
+import sys,json
+tasks=[t for t in json.load(sys.stdin) if t.get('endtime')]
+print(tasks[0].get('status','') if tasks else '')
+" 2>/dev/null)
+    if [ -n "$last_status" ] && [ "$last_status" != "OK" ]; then
+        emit_issue CRIT "Last vzdump run finished with errors: ${last_status}"
+    fi
+
+    # Per-guest freshness: every guest in an enabled job must have a backup
+    # newer than VZDUMP_MAX_AGE_H on that job's storage (0/unset = disabled).
+    local max_age_h="${VZDUMP_MAX_AGE_H:-0}"
+    if [ "$max_age_h" -gt 0 ] 2>/dev/null; then
+        local storage vmids stale guest msg
+        while read -r storage vmids; do
+            [ -z "$storage" ] && continue
+            stale=$(pvesh get "/nodes/${PVE_NODE}/storage/${storage}/content" --content backup --output-format json 2>/dev/null | python3 -c "
+import sys,json,time
+newest={}
+for e in json.load(sys.stdin):
+    v=str(e.get('vmid',''))
+    if v: newest[v]=max(newest.get(v,0), e.get('ctime',0))
+now=time.time()
+for v in '${vmids}'.split(','):
+    v=v.strip()
+    if not v: continue
+    if v not in newest:
+        print(f'{v}|has no backup on ${storage}')
+    elif (now-newest[v])/3600 > ${max_age_h}:
+        print(f'{v}|last backup {(now-newest[v])/86400:.1f}d ago (max ${max_age_h}h)')
+" 2>/dev/null)
+            while IFS='|' read -r guest msg; do
+                [ -z "$guest" ] && continue
+                emit_issue WARN "vzdump: guest ${guest} ${msg}"
+            done <<< "$stale"
+        done <<< "$(pvesh get /cluster/backup --output-format json 2>/dev/null | python3 -c "
+import sys,json
+for j in json.load(sys.stdin):
+    if j.get('enabled',1) and j.get('storage') and j.get('vmid'):
+        print(j['storage'], j['vmid'])
+" 2>/dev/null)"
+    fi
 }
 check_vzdump
 
@@ -910,8 +956,24 @@ check_ollama() {
     OLLAMA_LATEST=$(curl -s --connect-timeout 5 "$OLLAMA_RELEASES_API" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('tag_name','').lstrip('v'))" 2>/dev/null)
     OLLAMA_UPDATE_AVAIL=""
     if [ -n "$OLLAMA_LATEST" ] && [ "$OLLAMA_LATEST" != "$OLLAMA_VERSION" ]; then
-        OLLAMA_UPDATE_AVAIL="$OLLAMA_LATEST"
-        emit_issue WARN "Ollama update available: ${OLLAMA_VERSION} -> ${OLLAMA_LATEST}"
+        if [ "${OLLAMA_VERSION%.*}" != "${OLLAMA_LATEST%.*}" ]; then
+            # Minor/major bump - needs a coordinated GPU test, warn only
+            OLLAMA_UPDATE_AVAIL="$OLLAMA_LATEST"
+            emit_issue WARN "Ollama update available: ${OLLAMA_VERSION} -> ${OLLAMA_LATEST}"
+        elif [ -n "$OLLAMA_UPGRADE_HOOK" ] && [ -x "$OLLAMA_UPGRADE_HOOK" ]; then
+            # Patch release - apply silently via the external upgrade hook
+            if timeout 1800 "$OLLAMA_UPGRADE_HOOK" "$OLLAMA_LATEST" >/dev/null 2>&1; then
+                OLLAMA_VERSION="$OLLAMA_LATEST"
+                emit_issue INFO "Ollama patch-upgraded to ${OLLAMA_LATEST}"
+            else
+                OLLAMA_UPDATE_AVAIL="$OLLAMA_LATEST"
+                emit_issue WARN "Ollama patch auto-upgrade to ${OLLAMA_LATEST} failed - upgrade manually"
+            fi
+        else
+            # Patch release, no upgrade hook configured
+            OLLAMA_UPDATE_AVAIL="$OLLAMA_LATEST"
+            emit_issue WARN "Ollama update available: ${OLLAMA_VERSION} -> ${OLLAMA_LATEST}"
+        fi
     fi
 
     TAGS_JSON=$(curl -s --connect-timeout 3 "${OLLAMA_API}/api/tags" 2>/dev/null)
