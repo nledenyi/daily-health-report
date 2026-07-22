@@ -696,8 +696,11 @@ check_gpu_cgroup_majors() {
 check_gpu_cgroup_majors
 # TLS certificate expiry (check from Docker VM)
 if [ -n "$DOCKER_VM" ]; then
-    DOCKER_VM_IP=$(qm guest exec "$DOCKER_VM" -- hostname -I 2>/dev/null | \
-        python3 -c "import sys,json; d=json.load(sys.stdin); ips=d.get('out-data','').strip().split(); print(ips[0] if ips else '')" 2>/dev/null)
+    # `hostname -I` also lists Docker bridge gateways (172.x) in an order that
+    # changes whenever a stack adds or drops a network, so the first entry is not
+    # reliably the LAN address. Ask the guest which source IP it routes out with.
+    DOCKER_VM_IP=$(qm guest exec "$DOCKER_VM" -- ip -4 route get 1.1.1.1 2>/dev/null | \
+        python3 -c "import sys,json,re; m=re.search(r' src (\S+)', json.load(sys.stdin).get('out-data','')); print(m.group(1) if m else '')" 2>/dev/null)
     if [ -n "$DOCKER_VM_IP" ]; then
         CERT_END=$(echo | openssl s_client -connect "${DOCKER_VM_IP}:443" 2>/dev/null | \
             openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
