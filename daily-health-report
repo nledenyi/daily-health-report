@@ -1014,7 +1014,7 @@ else:
 ' 2>/dev/null)
 
     if [ -n "$OLLAMA_LXC" ]; then
-        OLLAMA_LOGS=$(pct exec "$OLLAMA_LXC" -- journalctl -u ollama --since "24 hours ago" --no-pager 2>/dev/null | grep '\[GIN\]')
+        OLLAMA_LOGS=$(pct exec "$OLLAMA_LXC" -- journalctl -u ollama --since "24 hours ago" --no-pager -o short-iso 2>/dev/null | grep '\[GIN\]')
     else
         OLLAMA_LOGS=""
     fi
@@ -1033,9 +1033,11 @@ else:
     OLLAMA_AVG_DURATION=$(echo "$OLLAMA_LOGS" | grep -E 'POST.*/api/(generate|chat)' | awk -F'|' '{gsub(/^ +| +$/,"",$3); gsub(/s$/,"",$3); if($3+0>0) print $3}' | awk '{s+=$1; n++} END {if(n>0) printf "%.1fs", s/n; else print "\xe2\x80\x94"}' 2>/dev/null)
     [ -z "$OLLAMA_AVG_DURATION" ] && OLLAMA_AVG_DURATION="—"
 
-    LAST_REQ_TIME=$(echo "$OLLAMA_LOGS" | grep -E 'POST.*/api/(generate|chat)' | tail -1 | grep -oP '\d{4}/\d{2}/\d{2} - \d{2}:\d{2}:\d{2}')
+    # Use journald's ISO timestamp, not the [GIN] one: the latter is naive local
+    # time in the guest's zone, which `date -d` here would read as the host's.
+    LAST_REQ_TIME=$(echo "$OLLAMA_LOGS" | grep -E 'POST.*/api/(generate|chat)' | tail -1 | grep -oP '^\S+')
     if [ -n "$LAST_REQ_TIME" ]; then
-        LAST_TS=$(date -d "$(echo "$LAST_REQ_TIME" | sed 's|/|-|g; s| - | |')" +%s 2>/dev/null)
+        LAST_TS=$(date -d "$LAST_REQ_TIME" +%s 2>/dev/null)
         NOW_TS=$(date +%s)
         if [ -n "$LAST_TS" ]; then
             IDLE_SECS=$((NOW_TS - LAST_TS))
