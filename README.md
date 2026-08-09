@@ -20,7 +20,7 @@ Designed to be **boring**: no daemons, no databases, no agents, no UI. A single 
 | Proxmox backups | vzdump coverage (jobs × guests), last-backup age, last-run task status (CRIT on errors), per-guest backup freshness against `VZDUMP_MAX_AGE_H` |
 | Guests | VM and LXC status, memory, disk %, pending `apt` updates, HASS OS special-case (`/mnt/data` instead of `/`) |
 | Postfix | deferred mail queue |
-| Docker | container health across a Docker VM and a docker-in-LXC, configurable critical-container patterns (CRIT on down) and non-critical ones (WARN on unhealthy/crash) |
+| Docker | container health across a Docker VM and a docker-in-LXC, configurable critical-container patterns (CRIT on down) and non-critical ones (WARN on unhealthy/crash), plus a `daily-health.ignore` container label that reports an instance without ever alerting on it |
 | Service health | Home Assistant API, PostgreSQL (via `pg_isready` in LXC), NVIDIA/AMD GPU driver presence, **LXC GPU cgroup major-number mismatches** (catches silent breakage after kernel/driver upgrades) |
 | Samba | `smbd`/`nmbd` active, TCP 445 listening, each configured share name still advertised by `smbclient -L //localhost` |
 | TLS | certificate expiry on the Docker host's 443 |
@@ -106,7 +106,7 @@ Every environment-specific value lives in `/etc/daily-health/config` (bash-sourc
 - **Guests**: `VM_IDS`, `VM_EXPECTED_STOPPED`, `HASS_OS_VM_IDS`
 - **Service LXCs**: `POSTGRES_LXC`, `DOCKER_VM`, `DOCKER_IN_LXC`, `OLLAMA_LXC`
 - **GPU**: `NVIDIA_UVM_LXCS`, `AMD_KFD_LXCS` (LXCs that should have matching cgroup device allows)
-- **Docker**: `DOCKER_CRITICAL_PATTERNS`, `DOCKER_CRITICAL_EXCLUDE` (bash glob patterns)
+- **Docker**: `DOCKER_CRITICAL_PATTERNS`, `DOCKER_CRITICAL_EXCLUDE` (bash glob patterns), `DOCKER_IGNORE_LABEL` (label name, default `daily-health.ignore`; a container carrying it set to `true` is counted and listed but never alerts, which is what a deliberately stopped test instance needs)
 - **Expected disks**: `EXPECTED_DISKS` (associative array, serial → description)
 
 Most fields accept empty string / empty array to disable their check. Unconfigured probes are silently skipped so you can start minimal and add coverage as you grow.

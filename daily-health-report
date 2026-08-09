@@ -481,16 +481,33 @@ check_postfix_queue
 # --- Docker Container Health (VM 104 + LXC 105) ---
 # Exports: DOCKER_CRIT_DATA, DOCKER_CRIT_COUNT, DOCKER_CRIT_UP, DOCKER_OTHER_RUNNING,
 #          DOCKER_OTHER_TOTAL, DOCKER_STOPPED_DATA, DOCKER_PS (non-empty = any host scanned)
-# Helper: inspect-row format (name|state|health|exit|restart); scan_docker_host parses it
-_DOCKER_FMT='{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}|{{.State.ExitCode}}|{{.HostConfig.RestartPolicy.Name}}'
+# Helper: inspect-row format (name|state|health|exit|restart|ignore-label);
+# scan_docker_host parses it
+DOCKER_IGNORE_LABEL="${DOCKER_IGNORE_LABEL:-daily-health.ignore}"
+_DOCKER_FMT="{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}|{{.State.ExitCode}}|{{.HostConfig.RestartPolicy.Name}}|{{if index .Config.Labels \"${DOCKER_IGNORE_LABEL}\"}}{{index .Config.Labels \"${DOCKER_IGNORE_LABEL}\"}}{{else}}-{{end}}"
 
 scan_docker_host() {
     local host_label="$1"
     local inspect_output="$2"
-    local dname dstate dhealth exit_code restart_pol is_crit stop_reason pat ex
-    while IFS='|' read -r dname dstate dhealth exit_code restart_pol; do
+    local dname dstate dhealth exit_code restart_pol ignore_label is_crit stop_reason pat ex
+    while IFS='|' read -r dname dstate dhealth exit_code restart_pol ignore_label; do
         [ -z "$dname" ] && continue
         dname="${dname#/}"
+        # A container carrying the ignore label is still counted and listed, but
+        # never raises an issue. That is what a test or scratch instance needs:
+        # left stopped on purpose, it should not page anyone, and it should not
+        # disappear from the report either.
+        case "$ignore_label" in
+            true | True | TRUE | 1 | yes)
+                DOCKER_OTHER_TOTAL=$((DOCKER_OTHER_TOTAL + 1))
+                if [ "$dstate" = "running" ] && [ "$dhealth" != "unhealthy" ]; then
+                    DOCKER_OTHER_RUNNING=$((DOCKER_OTHER_RUNNING + 1))
+                else
+                    DOCKER_STOPPED_DATA="${DOCKER_STOPPED_DATA}${dname}|ignored (${dstate})\n"
+                fi
+                continue
+                ;;
+        esac
         is_crit=false
         for pat in "${DOCKER_CRITICAL_PATTERNS[@]}"; do
             # shellcheck disable=SC2053

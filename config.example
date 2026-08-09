@@ -98,6 +98,14 @@ DOCKER_CRITICAL_PATTERNS=("traefik*" "cloudflared*" "tailscale*")
 # Sub-patterns matched WITHIN critical parent names that should NOT count as critical
 # (e.g. an authentik-postgresql sidecar is not itself infra-critical):
 DOCKER_CRITICAL_EXCLUDE=("*-postgresql*" "*-redis*" "*-db*")
+# Container label that silences a container completely: it is still counted and
+# listed in the report, but never raises CRIT or WARN whatever state it is in.
+# Meant for test and scratch instances that are left stopped on purpose, and it
+# travels with the container instead of needing a name added here. Set the label
+# in compose with:
+#     labels:
+#       daily-health.ignore: "true"
+DOCKER_IGNORE_LABEL="daily-health.ignore"
 
 # ===== Expected disks =====
 # SMART-monitored disks whose absence should raise CRIT. Serial -> description.
