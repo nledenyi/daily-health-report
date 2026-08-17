@@ -743,6 +743,69 @@ check_claude_remote() {
 }
 check_claude_remote
 
+# Remote site over Tailscale (config-driven; skipped unless REMOTE_SITE_SSH is set).
+# For an unattended site you never visit, every failure is silent: a NAS that did not
+# come back from a power cut, a VM that did not autostart, or a backup that quietly
+# stopped all look identical to "fine" until someone phones you.
+#
+# Two deliberate choices:
+#   * Reachability is a real SSH command, NOT ping. Tailscale's hybrid networking is
+#     not reliably pingable, so ICMP here produces false alarms.
+#   * The backup signal is the age of the newest backup file *as seen on the remote
+#     storage*, not the app's own "last backup OK" claim — it proves the file actually
+#     landed somewhere other than the machine being backed up.
+# The ssh alias and key live in an unprivileged user's home, but this script runs as
+# root, hence the sudo -u.
+check_remote_site() {
+    [ -n "$REMOTE_SITE_SSH" ] || return 0
+    local label="${REMOTE_SITE_LABEL:-remote site}"
+    local ssh_out rc backup_epoch age_h code max_age="${REMOTE_SITE_BACKUP_MAX_AGE_H:-36}"
+
+    # NOTE: the remote script ends in `exit 0` on purpose. Without it, a missing volume
+    # or an empty backup glob makes the *last* remote command fail, ssh returns non-zero,
+    # and we would report "unreachable" — masking the real fault with a wrong diagnosis.
+    # rc must mean transport failure and nothing else; state is read from the output.
+    ssh_out=$(timeout "${REMOTE_SITE_SSH_TIMEOUT:-45}" sudo -u "${REMOTE_SITE_SSH_USER:-claude}" \
+        ssh -o BatchMode=yes -o ConnectTimeout=15 "$REMOTE_SITE_SSH" \
+        "df ${REMOTE_SITE_VOLUME:-/} >/dev/null 2>&1 && echo VOL_OK; \
+         f=\$(ls -t ${REMOTE_SITE_BACKUP_GLOB:-/nonexistent} 2>/dev/null | head -1); \
+         [ -n \"\$f\" ] && stat -c %Y \"\$f\"; \
+         exit 0" 2>/dev/null)
+    rc=$?
+
+    if [ $rc -ne 0 ]; then
+        emit_issue CRIT "${label}: NAS unreachable over Tailscale (ssh ${REMOTE_SITE_SSH})"
+    else
+        case "$ssh_out" in
+            *VOL_OK*) ;;
+            *) emit_issue CRIT "${label}: ${REMOTE_SITE_VOLUME:-/} not mounted" ;;
+        esac
+        if [ -n "$REMOTE_SITE_BACKUP_GLOB" ]; then
+            backup_epoch=$(printf '%s\n' "$ssh_out" | grep -E '^[0-9]+$' | head -1)
+            if [ -z "$backup_epoch" ]; then
+                emit_issue CRIT "${label}: no backup file found (${REMOTE_SITE_BACKUP_GLOB})"
+            else
+                age_h=$(( ( $(date +%s) - backup_epoch ) / 3600 ))
+                [ "$age_h" -gt "$max_age" ] && \
+                    emit_issue CRIT "${label}: newest backup is ${age_h}h old (> ${max_age}h)"
+            fi
+        fi
+    fi
+
+    # Service itself. The plain address is the honest up/down signal.
+    if [ -n "$REMOTE_SITE_URL" ]; then
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 20 "$REMOTE_SITE_URL" 2>/dev/null)
+        [ "$code" = "200" ] || emit_issue CRIT "${label}: Home Assistant not responding (HTTP ${code:-timeout})"
+    fi
+    # The public hostname is a softer signal: if this fails while the above passed, the
+    # app is fine and it is the HTTPS/proxy layer (Tailscale Serve, cert) that broke.
+    if [ -n "$REMOTE_SITE_HTTPS_URL" ]; then
+        code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 20 "$REMOTE_SITE_HTTPS_URL" 2>/dev/null)
+        [ "$code" = "200" ] || emit_issue WARN "${label}: HTTPS name failing (HTTP ${code:-timeout}) — proxy/cert, app itself is up"
+    fi
+}
+check_remote_site
+
 # Custom file-freshness checks (config-driven). Each FRESHNESS_CHECKS entry is
 # "Label|path_or_glob|warn_hours|crit_hours": a glob selects the newest match,
 # a plain path is used directly, a missing file (or no glob match) is CRIT.

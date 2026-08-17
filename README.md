@@ -26,6 +26,7 @@ Designed to be **boring**: no daemons, no databases, no agents, no UI. A single 
 | TLS | certificate expiry on the Docker host's 443 |
 | Syncthing | API reachability, per-folder pull errors, peer offline > 24h |
 | `claude-remote.service` | systemd active + `claude remote-control` process alive |
+| Remote site over Tailscale | an unattended second site: NAS reachable (**SSH, not ping** — Tailscale hybrid networking is not reliably pingable), its data volume still mounted, the service answering, and the **age of the newest backup file as seen on the remote storage** (proves the backup actually landed off-box, unlike the app's own "last backup OK" claim). The public HTTPS name is checked separately as WARN, so a broken proxy/cert is distinguishable from a dead service. |
 | Updates | `unattended-upgrades` status, reboot-required flag, package NEWS, PVE + kernel available-update detection |
 | ZFS scrub | last-run + errors per pool |
 | Ollama | version + GitHub release check (minor/major bumps WARN; patch releases auto-applied via optional `OLLAMA_UPGRADE_HOOK`), models, GPU offload, request count + errors over 24h, tokens, tok/s, idle time |

@@ -117,3 +117,18 @@ declare -gA EXPECTED_DISKS=(
 
 # ===== Ollama release check (optional) =====
 OLLAMA_RELEASES_API="https://api.github.com/repos/ollama/ollama/releases/latest"
+
+# --- Remote site over Tailscale (optional) -----------------------------------
+# A second site you never physically visit (e.g. family's NAS + Home Assistant).
+# Leave REMOTE_SITE_SSH empty to disable the whole check.
+# Reachability uses SSH, not ping: Tailscale hybrid networking is not reliably
+# pingable. The ssh alias/key live in an unprivileged user's home, so the check
+# runs ssh via sudo -u REMOTE_SITE_SSH_USER.
+REMOTE_SITE_SSH=""                     # ssh alias, e.g. "family-nas" (empty = disabled)
+REMOTE_SITE_LABEL="remote site"        # shown in alerts
+REMOTE_SITE_SSH_USER="claude"          # user owning the ssh config/key
+REMOTE_SITE_VOLUME="/volume2"          # volume that must stay mounted (holds the VM)
+REMOTE_SITE_BACKUP_GLOB=""             # e.g. "/volume1/hass-backup/*/*.tar" (empty = skip)
+REMOTE_SITE_BACKUP_MAX_AGE_H=36        # CRIT if the newest backup is older than this
+REMOTE_SITE_URL=""                     # e.g. "http://100.x.y.z" — plain up/down signal
+REMOTE_SITE_HTTPS_URL=""               # e.g. "https://host.tailnet.ts.net" — WARN only
