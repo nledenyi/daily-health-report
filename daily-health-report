@@ -711,6 +711,57 @@ check_gpu_cgroup_majors() {
     fi
 }
 check_gpu_cgroup_majors
+
+# Kernel pin drift. Three failure modes, all previously invisible in this report -
+# which is why a pin advance sat unbooted for 12+ days in 2026-08 with no warning.
+# See homelab/kernel-pin.md.
+#
+# Deliberately does NOT warn merely because a newer MAJOR series exists. That needs
+# explicit validation (DKMS build + a maintenance window), and nagging about it daily
+# would train the reader to ignore this check entirely.
+check_kernel_pin_drift() {
+    local pin_file="${KERNEL_PIN_FILE:-/etc/default/grub.d/proxmox-kernel-pin.cfg}"
+    local grub_cfg="${GRUB_CFG:-/boot/grub/grub.cfg}"
+    local pinned running series newest entry
+
+    # No pin configured is a valid state (Proxmox default) - nothing to drift.
+    [ -r "$pin_file" ] || return 0
+
+    pinned=$(grep -oP 'gnulinux-\K[0-9][0-9._-]*-pve(?=-advanced)' "$pin_file" 2>/dev/null | head -1)
+    if [ -z "$pinned" ]; then
+        emit_issue WARN "Kernel pin file exists but no kernel could be parsed from it ($pin_file) - pin may be malformed and therefore inert"
+        return 0
+    fi
+
+    # 1. The pin names a GRUB menuentry that does not exist. This fails SILENTLY:
+    #    GRUB falls through to the default (newest kernel), which is the exact
+    #    outcome the pin exists to prevent. Highest severity for that reason.
+    entry=$(grep -oP 'gnulinux-[0-9][^"]*-advanced-[a-f0-9-]+' "$pin_file" 2>/dev/null | head -1)
+    if [ -n "$entry" ] && [ -r "$grub_cfg" ] && ! grep -q "$entry" "$grub_cfg" 2>/dev/null; then
+        emit_issue CRIT "Kernel pin is INERT: pinned entry for ${pinned} not found in ${grub_cfg} - next boot will use the newest kernel instead. Run update-grub."
+    fi
+
+    # 2. Pinned but never rebooted onto - a staged change nobody can see.
+    running=$(uname -r)
+    if [ "$pinned" != "$running" ]; then
+        emit_issue WARN "Kernel pin drift: pinned ${pinned} but running ${running} - reboot pending to activate the pinned kernel"
+    fi
+
+    # 3. A same-series advance is available. DKMS has almost certainly already built
+    #    for it (same series, auto-build), so this is the cheap, safe advance.
+    series=$(echo "$pinned" | grep -oP '^[0-9]+\.[0-9]+')
+    if [ -n "$series" ]; then
+        newest=$(dpkg -l 'proxmox-kernel-[0-9]*' 2>/dev/null \
+                 | awk '/^ii.*pve-signed/ {print $2}' \
+                 | sed 's/proxmox-kernel-//;s/-signed//' \
+                 | grep "^${series}\." | sort -V | tail -1)
+        if [ -n "$newest" ] && [ "$newest" != "$pinned" ] \
+           && [ "$(printf '%s\n%s\n' "$pinned" "$newest" | sort -V | tail -1)" = "$newest" ]; then
+            emit_issue WARN "Kernel pin is stale: pinned ${pinned}, but ${newest} is installed in the same series - verify DKMS then advance the pin"
+        fi
+    fi
+}
+check_kernel_pin_drift
 # TLS certificate expiry (check from Docker VM)
 if [ -n "$DOCKER_VM" ]; then
     # `hostname -I` also lists Docker bridge gateways (172.x) in an order that
