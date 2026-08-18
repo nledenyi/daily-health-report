@@ -126,6 +126,15 @@ check_disks() {
     FOUND_SERIALS=()
     for disk in /dev/sd? /dev/nvme0; do
         [ -e "$disk" ] || continue
+        # Skip removable devices. The only one here is a USB card reader that
+        # presents a 192.5K "USB Special Disk" with no SMART support, so it sat in
+        # the table as a permanent "N/A / ?°C / ?" row that reads like a sick disk.
+        # All seven real disks report removable=0. A real disk that somehow matched
+        # this would still be caught loudly: skipping it keeps its serial out of
+        # FOUND_SERIALS, which trips the "Missing disk" CRIT below.
+        if [ "$(cat "/sys/block/$(basename "$disk")/removable" 2>/dev/null)" = "1" ]; then
+            continue
+        fi
         smartout=$(smartctl -A "$disk" 2>/dev/null)
         smartinfo=$(smartctl -i "$disk" 2>/dev/null)
         serial=$(echo "$smartinfo" | grep -i 'Serial Number' | awk '{print $NF}')
