@@ -334,8 +334,15 @@ import sys,json
 tasks=[t for t in json.load(sys.stdin) if t.get('endtime')]
 print(tasks[0].get('status','') if tasks else '')
 " 2>/dev/null)
+    # "WARNINGS: n" means the job succeeded but emitted advisories (e.g. a guest
+    # EFI disk missing ms-cert=2023k). That is not a backup failure, and since
+    # this reads the *last* task it would otherwise re-CRIT daily until the next
+    # weekly run. Only a genuine failure pages.
     if [ -n "$last_status" ] && [ "$last_status" != "OK" ]; then
-        emit_issue CRIT "Last vzdump run finished with errors: ${last_status}"
+        case "$last_status" in
+            WARNINGS:*) emit_issue WARN "Last vzdump run finished with warnings: ${last_status}" ;;
+            *)          emit_issue CRIT "Last vzdump run failed: ${last_status}" ;;
+        esac
     fi
 
     # Per-guest freshness: every guest in an enabled job must have a backup
