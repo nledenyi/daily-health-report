@@ -810,6 +810,171 @@ check_claude_remote() {
 }
 check_claude_remote
 
+# UniFi network health (config-driven; skipped unless UNIFI_HOST is set).
+# Three signals the controller does not raise on its own:
+#   * an AP whose WIRED uplink negotiated below expectation. A gigabit AP sitting at
+#     100 Mbps still passes traffic, so nothing complains and it can persist for days.
+#   * a named critical client whose RSSI has drifted below a floor.
+#   * switch-port link flaps, counted since the previous run. Flaps are the LEADING
+#     indicator on a marginal cable (errors are the lagging one) and they are NOT
+#     exported by unpoller, so Prometheus cannot see them - hence reading them here.
+# Every threshold and every exclusion is config-driven; see config.example.
+check_unifi() {
+    [ -n "$UNIFI_HOST" ] || return 0
+    local state_dir=/var/lib/daily-health
+    mkdir -p "$state_dir" 2>/dev/null
+    local out rc
+    # NOTE: the config is `source`d without `set -a`, so its vars are shell-local
+    # and do NOT reach a child process. Every var the block reads must be passed
+    # explicitly here — same pattern as the HA check above. (Fixed 2026-08-29:
+    # only UNIFI_STATE was passed, so UNIFI_HOST arrived empty and every run
+    # reported "UniFi controller unreachable (URLError)".)
+    out=$(UNIFI_STATE="$state_dir/unifi-flaps.state" \
+          UNIFI_HOST="$UNIFI_HOST" UNIFI_USER="$UNIFI_USER" UNIFI_PASS="$UNIFI_PASS" \
+          UNIFI_SITE="$UNIFI_SITE" UNIFI_UPLINK_MIN_MBPS="$UNIFI_UPLINK_MIN_MBPS" \
+          UNIFI_UPLINK_EXCLUDE="$UNIFI_UPLINK_EXCLUDE" UNIFI_RSSI_CLIENTS="$UNIFI_RSSI_CLIENTS" \
+          UNIFI_RSSI_MIN_DBM="$UNIFI_RSSI_MIN_DBM" UNIFI_FLAP_EXCLUDE="$UNIFI_FLAP_EXCLUDE" \
+          UNIFI_FLAP_WARN_DELTA="$UNIFI_FLAP_WARN_DELTA" \
+          python3 - <<'PYUNIFI'
+import json, os, ssl, sys, urllib.request, urllib.error, http.cookiejar
+
+H   = os.environ.get("UNIFI_HOST", "")
+U   = os.environ.get("UNIFI_USER", "")
+P   = os.environ.get("UNIFI_PASS", "")
+MIN = float(os.environ.get("UNIFI_UPLINK_MIN_MBPS") or 1000)
+EXU = [x for x in (os.environ.get("UNIFI_UPLINK_EXCLUDE") or "").split(",") if x.strip()]
+CLI = [x.strip() for x in (os.environ.get("UNIFI_RSSI_CLIENTS") or "").split(",") if x.strip()]
+RMIN= float(os.environ.get("UNIFI_RSSI_MIN_DBM") or -75)
+EXP = [x for x in (os.environ.get("UNIFI_FLAP_EXCLUDE") or "").split(",") if x.strip()]
+FDEL= int(os.environ.get("UNIFI_FLAP_WARN_DELTA") or 1)
+SITE= os.environ.get("UNIFI_SITE") or "default"
+STATE = os.environ.get("UNIFI_STATE")
+
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+# Persist the session cookie between runs. UniFi rate-limits the LOGIN endpoint
+# (HTTP 429 / AUTHENTICATION_FAILED_LIMIT_REACHED) after a handful of attempts, so
+# authenticating on every invocation is fragile and makes ad-hoc testing trip the
+# limiter. Reuse the cookie; only log in when it is actually rejected.
+COOK = (STATE or "/tmp/unifi") + ".cookies"
+jar = http.cookiejar.MozillaCookieJar(COOK)
+try:
+    jar.load(ignore_discard=True, ignore_expires=True)
+except Exception:
+    pass
+op = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=ctx),
+    urllib.request.HTTPCookieProcessor(jar))
+
+def api(path, data=None):
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request("https://%s%s" % (H, path), data=body,
+                                 headers={"Content-Type": "application/json"})
+    with op.open(req, timeout=25) as r:
+        return json.loads(r.read().decode() or "{}")
+
+def login():
+    api("/api/auth/login", {"username": U, "password": P})
+    try:
+        jar.save(ignore_discard=True, ignore_expires=True)
+        os.chmod(COOK, 0o600)
+    except Exception:
+        pass
+
+DEV = "/proxy/network/api/s/%s/stat/device" % SITE
+STA = "/proxy/network/api/s/%s/stat/sta" % SITE
+try:
+    try:
+        devs = api(DEV).get("data", [])          # is the cached session still valid?
+    except urllib.error.HTTPError as e:
+        if e.code not in (401, 403):
+            raise
+        login()
+        devs = api(DEV).get("data", [])
+    stas = api(STA).get("data", [])
+except urllib.error.HTTPError as e:
+    if e.code == 429:
+        print("WARN|UniFi login rate-limited (HTTP 429): too many auth attempts, backing off")
+    else:
+        print("WARN|UniFi API returned HTTP %s" % e.code)
+    sys.exit(0)
+except Exception as e:
+    print("WARN|UniFi controller unreachable (%s: %s)" % (type(e).__name__, str(e)[:120]))
+    sys.exit(0)
+
+# 1. wired AP uplinks below expectation
+for d in devs:
+    if d.get("type") != "uap":
+        continue
+    name = d.get("name") or d.get("mac")
+    if name in EXU:
+        continue
+    up = d.get("uplink") or {}
+    if up.get("type") != "wire":
+        continue                      # meshed AP: no wired uplink to judge
+    sp = up.get("speed")
+    if sp is not None and float(sp) < MIN:
+        print("WARN|UniFi %s wired uplink at %s Mbps (expected >= %d)" % (name, sp, MIN))
+
+# 2. named clients below an RSSI floor
+by = {}
+for c in stas:
+    n = c.get("name") or c.get("hostname") or ""
+    if n:
+        by[n] = c
+for want in CLI:
+    c = by.get(want)
+    if c is None:
+        print("WARN|UniFi watched client %s not associated" % want)
+        continue
+    sig = c.get("signal")
+    if sig is not None and float(sig) < RMIN:
+        print("WARN|UniFi %s at %s dBm on %s (floor %d)" % (
+            want, sig, c.get("essid") or "?", RMIN))
+
+# 3. switch-port link flaps since the previous run
+prev = {}
+if STATE and os.path.exists(STATE):
+    try:
+        prev = json.load(open(STATE))
+    except Exception:
+        prev = {}
+cur = {}
+for d in devs:
+    if d.get("type") != "usw":
+        continue
+    sw = d.get("name") or d.get("mac")
+    for pt in d.get("port_table") or []:
+        pname = pt.get("name") or ("Port %s" % pt.get("port_idx"))
+        key = "%s/%s" % (sw, pt.get("port_idx"))
+        if pname in EXP or key in EXP:
+            continue
+        ld = pt.get("link_down_count")
+        if ld is None:
+            continue
+        cur[key] = ld
+        if key in prev:
+            delta = ld - prev[key]
+            # delta > 0 guard: FDEL=0 would otherwise warn on every stable port
+            if delta > 0 and delta >= FDEL:
+                print("WARN|UniFi %s %s: %d link flap(s) since yesterday" % (sw, pname, delta))
+if STATE:
+    try:
+        json.dump(cur, open(STATE, "w"))
+    except Exception:
+        pass
+PYUNIFI
+)
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        emit_issue WARN "UniFi check failed to run (exit $rc)"
+        return 0
+    fi
+    while IFS='|' read -r lvl msg; do
+        [ -n "$msg" ] && emit_issue "$lvl" "$msg"
+    done <<< "$out"
+}
+check_unifi
+
 # Remote site over Tailscale (config-driven; skipped unless REMOTE_SITE_SSH is set).
 # For an unattended site you never visit, every failure is silent: a NAS that did not
 # come back from a power cut, a VM that did not autostart, or a backup that quietly
@@ -1269,7 +1434,7 @@ check_temperatures() {
     TEMP_DATA=""
     [ -n "$CPU_TEMP" ] && TEMP_DATA="${TEMP_DATA}CPU Package|${CPU_TEMP}°C\n"
     [ -n "$NVME_TEMP" ] && TEMP_DATA="${TEMP_DATA}NVMe (Kingston)|${NVME_TEMP}°C\n"
-    [ -n "$GPU_TEMP" ] && TEMP_DATA="${TEMP_DATA}GPU (GTX 1660 SUPER)|${GPU_TEMP}°C\n"
+    [ -n "$GPU_TEMP" ] && TEMP_DATA="${TEMP_DATA}GPU (RTX 2070 SUPER)|${GPU_TEMP}°C\n"
     if [ "$AMD_GPU_SLEEP" = "yes" ]; then
         AMD_GPU_LINE="GPU (R9700)|sleep"
         if [ -n "$AMD_GPU_VRAM_USED" ]; then
@@ -1624,7 +1789,7 @@ fi
 TEMP_DATA_SHORT=$(echo -e "$TEMP_DATA" | sed \
     -e 's/CPU Package/CPU/' \
     -e 's/NVMe (Kingston)/NVMe/' \
-    -e 's/GPU (GTX 1660 SUPER)/1660S/' \
+    -e 's/GPU (RTX 2070 SUPER)/2070S/' \
     -e 's/GPU (R9700)/R9700/' \
     -e 's/10G NIC (Aquantia)/10G NIC/')
 

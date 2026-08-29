@@ -132,3 +132,31 @@ REMOTE_SITE_BACKUP_GLOB=""             # e.g. "/volume1/hass-backup/*/*.tar" (em
 REMOTE_SITE_BACKUP_MAX_AGE_H=36        # CRIT if the newest backup is older than this
 REMOTE_SITE_URL=""                     # e.g. "http://100.x.y.z" — plain up/down signal
 REMOTE_SITE_HTTPS_URL=""               # e.g. "https://host.tailnet.ts.net" — WARN only
+
+# --- UniFi (optional; the whole check is skipped unless UNIFI_HOST is set) ---
+# Use a READ-ONLY controller account. The check only ever GETs.
+# It surfaces three things the controller does not alert on by itself:
+#   * an AP whose wired uplink negotiated below UNIFI_UPLINK_MIN_MBPS. A gigabit AP
+#     running at 100 Mbps still passes traffic, so nothing complains for days.
+#   * a named client whose signal drifted below UNIFI_RSSI_MIN_DBM.
+#   * switch-port link flaps since the previous run. Flaps lead, errors lag - and the
+#     unpoller Prometheus exporter does NOT export link_down_count, so this is the
+#     only place they are visible.
+# The session cookie is cached next to the state file: the controller rate-limits the
+# login endpoint (HTTP 429) after a few attempts, which repeated testing will trip.
+#UNIFI_HOST=192.0.2.10          # controller IP or hostname (RFC 5737 example addr)
+#UNIFI_USER=readonly-user
+#UNIFI_PASS=changeme
+#UNIFI_SITE=default
+#UNIFI_UPLINK_MIN_MBPS=1000
+# Comma-separated AP names to skip. Wireless-meshed APs are skipped automatically
+# (their uplink.type is not "wire"), so they do not need listing here.
+#UNIFI_UPLINK_EXCLUDE=
+# Comma-separated client names, matched against the controller's name or hostname.
+#UNIFI_RSSI_CLIENTS=Doorbell,Garden Cam
+#UNIFI_RSSI_MIN_DBM=-75
+# Comma-separated port names (or "Switch/portidx") to ignore for flaps. Devices that
+# legitimately drop the link - e.g. a PC sleeping with Wake-on-LAN, which parks its
+# NIC at 10 Mbps - belong here or they warn every night.
+#UNIFI_FLAP_EXCLUDE=P04-DeskPC
+#UNIFI_FLAP_WARN_DELTA=1
