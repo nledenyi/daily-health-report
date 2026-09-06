@@ -618,7 +618,7 @@ check_services() {
     if [ -n "$HA_URL" ] && [ -n "$HA_TOKEN" ]; then
         local base="${HA_URL%/}"
         local entity="${HA_ASSIST_ENTITY:-conversation.ollama_conversation}"
-        HA_TOKEN="$HA_TOKEN" HA_BASE="$base" HA_ENTITY="$entity" python3 - <<'PYEOF' | while IFS= read -r line; do [ -n "$line" ] && ISSUES+=("$line"); done
+        HA_TOKEN="$HA_TOKEN" HA_BASE="$base" HA_ENTITY="$entity" HA_LLM_DOMAIN="${HA_LLM_DOMAIN:-ollama}" python3 - <<'PYEOF' | while IFS= read -r line; do [ -n "$line" ] && ISSUES+=("$line"); done
 import os, json, urllib.request
 
 base = os.environ["HA_BASE"]
@@ -629,18 +629,23 @@ def get(path):
     return json.loads(urllib.request.urlopen(r, timeout=8).read())
 
 try:
-    entries = get("/config/config_entries/entry?domain=ollama")
+    # Domain is configurable because the conversation backend is not fixed:
+    # this lab moved from the `ollama` integration to a custom OpenAI-compatible
+    # one. Hardcoding the old domain would have reported CRIT every day for an
+    # integration that was deliberately retired.
+    domain = os.environ.get("HA_LLM_DOMAIN", "ollama")
+    entries = get(f"/config/config_entries/entry?domain={domain}")
     if not entries:
-        print("WARN|HA Ollama integration not configured")
+        print(f"WARN|HA {domain} integration not configured")
     else:
         for e in entries:
             st = e.get("state", "?")
             if st in ("setup_error", "setup_retry", "migration_error", "failed_unload"):
-                print(f"CRIT|HA Ollama integration in state '{st}' (entry {e.get('title','?')})")
+                print(f"CRIT|HA {domain} integration in state '{st}' (entry {e.get('title','?')})")
             elif st != "loaded":
-                print(f"WARN|HA Ollama integration in state '{st}'")
+                print(f"WARN|HA {domain} integration in state '{st}'")
 except Exception as ex:
-    print(f"WARN|HA Ollama integration check failed: {type(ex).__name__}")
+    print(f"WARN|HA conversation integration check failed: {type(ex).__name__}")
 
 try:
     s = get(f"/states/{os.environ['HA_ENTITY']}")
@@ -1394,6 +1399,95 @@ else:
 }
 check_ollama
 
+# --- vLLM + LLM proxy (LXC $VLLM_LXC) ---
+# Exports: VLLM_OK + VLLM_* / PROXY_* fields used by the vLLM section renderer.
+#
+# THE KERNEL GATE IS THE POINT OF THIS CHECK. When the hand-written MXFP4 kernel
+# is not selected, the server still starts, still answers, and still looks
+# healthy - it is just about 4x slower. There is no error anywhere. The only
+# signal is one line in the boot log, so it is checked explicitly and alerts.
+check_vllm() {
+    VLLM_OK="unknown"
+    VLLM_MODEL=""
+    VLLM_KERNEL=""
+    VLLM_KV=""
+    VLLM_MAXLEN=""
+    VLLM_TTFT=""
+    VLLM_RESTARTS=""
+    VLLM_UPTIME=""
+    PROXY_OK="unknown"
+    PROXY_MODELS=""
+
+    [ -z "$VLLM_API" ] && { VLLM_OK="skipped"; return; }
+
+    if [ -n "$VLLM_LXC" ] && ! pct status "$VLLM_LXC" 2>/dev/null | grep -q running; then
+        VLLM_OK="fail"
+        emit_issue CRIT "vLLM LXC $VLLM_LXC is not running"
+        return
+    fi
+
+    MODELS_JSON=$(curl -s --connect-timeout 5 --max-time 15 "${VLLM_API}/v1/models" 2>/dev/null)
+    if [ -z "$MODELS_JSON" ]; then
+        VLLM_OK="fail"
+        emit_issue CRIT "vLLM API not responding - every LLM consumer is down"
+        return
+    fi
+    VLLM_MODEL=$(echo "$MODELS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin)['data'][0]; print(d.get('id','?'))" 2>/dev/null)
+    VLLM_MAXLEN=$(echo "$MODELS_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin)['data'][0]; print(d.get('max_model_len') or '?')" 2>/dev/null)
+    VLLM_OK="ok"
+
+    if [ -n "$VLLM_MAXLEN_EXPECTED" ] && [ "$VLLM_MAXLEN" != "$VLLM_MAXLEN_EXPECTED" ]; then
+        emit_issue WARN "vLLM max_model_len is $VLLM_MAXLEN, expected $VLLM_MAXLEN_EXPECTED (quiet capacity downgrade)"
+    fi
+
+    # Boot log: kernel gate and the KV pool it actually got.
+    if [ -n "$VLLM_LXC" ] && [ -n "$VLLM_UNIT" ]; then
+        BOOTLOG=$(pct exec "$VLLM_LXC" -- journalctl -u "$VLLM_UNIT" -b --no-pager 2>/dev/null | tail -4000)
+        if [ -n "$BOOTLOG" ]; then
+            if echo "$BOOTLOG" | grep -q "RadianceMxfp4W4A8LinearKernel"; then
+                VLLM_KERNEL="native MXFP4 W4A8"
+            else
+                VLLM_KERNEL="EMULATION"
+                emit_issue CRIT "vLLM is NOT using the native MXFP4 kernel - expect roughly 4x slower generation with no other symptom"
+            fi
+            VLLM_KV=$(echo "$BOOTLOG" | grep -oE "GPU KV cache size: [0-9,]+ tokens" | tail -1 | grep -oE "[0-9,]+")
+        fi
+        VLLM_RESTARTS=$(pct exec "$VLLM_LXC" -- systemctl show "$VLLM_UNIT" -p NRestarts --value 2>/dev/null)
+        VLLM_UPTIME=$(pct exec "$VLLM_LXC" -- systemctl show "$VLLM_UNIT" -p ActiveEnterTimestamp --value 2>/dev/null)
+        if [ -n "$VLLM_RESTARTS" ] && [ "$VLLM_RESTARTS" -gt 0 ] 2>/dev/null; then
+            emit_issue WARN "vLLM has restarted $VLLM_RESTARTS time(s) - check for crash-looping"
+        fi
+    fi
+
+    # Proxy: liveness plus a real alias listing. Liveness alone would stay green
+    # with an empty model list, which is a configuration failure that matters.
+    if [ -n "$PROXY_API" ]; then
+        if curl -sf --connect-timeout 3 --max-time 10 "${PROXY_API}/health/liveliness" >/dev/null 2>&1; then
+            PROXY_OK="ok"
+        else
+            PROXY_OK="fail"
+            emit_issue CRIT "LLM proxy not responding - HA Assist, Frigate GenAI and OpenWebUI all route through it"
+        fi
+        if [ -n "$PROXY_KEY" ]; then
+            PROXY_MODELS=$(curl -s --connect-timeout 3 --max-time 10 -H "Authorization: Bearer ${PROXY_KEY}" \
+                "${PROXY_API}/v1/models" 2>/dev/null | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null)
+            if [ "$PROXY_OK" = "ok" ] && [ "${PROXY_MODELS:-0}" = "0" ]; then
+                emit_issue WARN "LLM proxy is up but exposes no models"
+            fi
+            # Fixed-prompt latency probe. Trended daily: this is the cheapest way
+            # to notice a regression that trips no binary check, which is exactly
+            # how the original 4x slowdown hid.
+            if [ "$PROXY_OK" = "ok" ] && [ -n "$PROXY_PROBE_MODEL" ]; then
+                VLLM_TTFT=$(curl -s -o /dev/null -w "%{time_starttransfer}" --connect-timeout 5 --max-time 120 \
+                    -H "Authorization: Bearer ${PROXY_KEY}" -H "Content-Type: application/json" \
+                    -d "{\"model\":\"${PROXY_PROBE_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Say OK.\"}],\"max_tokens\":8,\"temperature\":0,\"stream\":true}" \
+                    "${PROXY_API}/v1/chat/completions" 2>/dev/null)
+            fi
+        fi
+    fi
+}
+check_vllm
+
 # --- Temperatures ---
 # Depends on: SMART_DATA (from check_disks)
 # Exports: TEMP_DATA, DISK_TEMP_RANGE
@@ -1723,7 +1817,7 @@ if [ "$UAU_REBOOT_REQUIRED" = "yes" ]; then
     MAINT_SUMMARY="${MAINT_SUMMARY}, reboot needed"
 fi
 
-# Ollama summary
+# Ollama summary (retired: OLLAMA_OK is "skipped" when OLLAMA_API is blank)
 if [ "$OLLAMA_OK" = "ok" ]; then
     OLLAMA_TG_SUMMARY="${OLLAMA_MODELS_COUNT} models, ${OLLAMA_REQ_24H} req/24h, idle ${OLLAMA_IDLE_TIME}"
     [ "$OLLAMA_GPU_OFFLOAD" != "idle" ] && OLLAMA_TG_SUMMARY="${OLLAMA_TG_SUMMARY}, ${OLLAMA_GPU_OFFLOAD}"
@@ -1744,7 +1838,7 @@ $(_tg_kpi "$GUEST_OK" "VMs / Containers")
  ${GUEST_SUMMARY}
 $(_tg_kpi "$DOCKER_OK" "Docker Services")
  ${DOCKER_TG_SUMMARY}
-$(_tg_kpi "$OLLAMA_OK" "Ollama")
+$(_tg_kpi "$VLLM_OK" "vLLM")$([ "$VLLM_KERNEL" = "EMULATION" ] && echo " (EMULATION!)")
  ${OLLAMA_TG_SUMMARY}
 $(_tg_kpi "$MAINT_OK" "Maintenance") $(_tg_kpi_warn "$SANOID_COV" "${SANOID_COVERED_DS}/${SANOID_TOTAL_DS}")
  ${MAINT_SUMMARY}
@@ -1999,10 +2093,47 @@ if [ "$OLLAMA_OK" = "ok" ]; then
     HTML="${HTML}
       </table>
     </div>"
+elif [ "$OLLAMA_OK" = "skipped" ]; then
+    # Ollama retired in favour of vLLM (OLLAMA_API blank in config). Render
+    # nothing at all - a red "Not responding" box for a service that was
+    # deliberately switched off trains the reader to ignore red boxes.
+    :
 else
     HTML="${HTML}
     <div class='section'>
       <h2>Ollama (LXC 106)</h2>
+      <div style='font-size:11px;color:#e74c3c'>&#10060; Not responding</div>
+    </div>"
+fi
+
+# vLLM + LLM proxy section
+if [ "$VLLM_OK" = "ok" ]; then
+    if [ "$VLLM_KERNEL" = "EMULATION" ]; then KERN_CLS="r"; else KERN_CLS="g"; fi
+    if [ "$PROXY_OK" = "ok" ]; then PROXY_CLS="g"; PROXY_TXT="up"; else PROXY_CLS="r"; PROXY_TXT="DOWN"; fi
+    HTML="${HTML}
+    <div class='section'>
+      <h2>vLLM (LXC ${VLLM_LXC})</h2>
+      <table>
+        <tr><td><strong>Model</strong></td><td>${VLLM_MODEL}</td></tr>
+        <tr><td><strong>Kernel</strong></td><td><span class='${KERN_CLS}'>${VLLM_KERNEL:-unknown}</span></td></tr>
+        <tr><td><strong>Context</strong></td><td>${VLLM_MAXLEN} tokens</td></tr>"
+    [ -n "$VLLM_KV" ] && HTML="${HTML}
+        <tr><td><strong>KV pool</strong></td><td>${VLLM_KV} tokens</td></tr>"
+    [ -n "$VLLM_RESTARTS" ] && HTML="${HTML}
+        <tr><td><strong>Restarts</strong></td><td>${VLLM_RESTARTS}</td></tr>"
+    HTML="${HTML}
+        <tr><td><strong>Proxy</strong></td><td><span class='${PROXY_CLS}'>${PROXY_TXT}</span>$([ -n "$PROXY_MODELS" ] && echo " (${PROXY_MODELS} aliases)")</td></tr>"
+    [ -n "$VLLM_TTFT" ] && HTML="${HTML}
+        <tr><td><strong>TTFT probe</strong></td><td>${VLLM_TTFT}s</td></tr>"
+    HTML="${HTML}
+      </table>
+    </div>"
+elif [ "$VLLM_OK" = "skipped" ]; then
+    :
+else
+    HTML="${HTML}
+    <div class='section'>
+      <h2>vLLM (LXC ${VLLM_LXC})</h2>
       <div style='font-size:11px;color:#e74c3c'>&#10060; Not responding</div>
     </div>"
 fi

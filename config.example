@@ -18,6 +18,19 @@ MAIL_FROM="Proxmox <root@$(hostname -f 2>/dev/null || hostname)>"
 HA_URL="http://192.168.1.10:8123/api/"
 HA_TOKEN=""                                           # Long-Lived Access Token — enables Assist conversation-agent health check
 HA_ASSIST_ENTITY="conversation.ollama_conversation"   # entity to verify is not 'unavailable'
+HA_LLM_DOMAIN="ollama"                                # config-entry domain of the conversation backend
+
+# vLLM (leave VLLM_API empty to skip the whole vLLM/proxy section)
+VLLM_API="http://192.168.1.20:8000"
+VLLM_LXC=106                      # LXC hosting the vLLM systemd unit
+VLLM_UNIT="vllm-qwen38"           # unit name, used for the boot-log kernel check
+VLLM_MAXLEN_EXPECTED=204800       # warn if the served context silently shrinks
+
+# LLM proxy in front of vLLM (LiteLLM). Every consumer routes through this,
+# so it is checked separately from the model server.
+PROXY_API="http://192.168.1.20:4000"
+PROXY_KEY=""                      # proxy master/virtual key
+PROXY_PROBE_MODEL="voice"         # alias used for the daily TTFT latency probe
 
 # Ollama (leave OLLAMA_API empty to skip the entire Ollama section)
 OLLAMA_API="http://192.168.1.20:11434"
