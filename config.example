@@ -160,3 +160,10 @@ REMOTE_SITE_HTTPS_URL=""               # e.g. "https://host.tailnet.ts.net" — 
 # NIC at 10 Mbps - belong here or they warn every night.
 #UNIFI_FLAP_EXCLUDE=P04-DeskPC
 #UNIFI_FLAP_WARN_DELTA=1
+
+# NVIDIA VRAM headroom thresholds (MiB free). The card is shared by several
+# tenants that grow independently - local STT, vision embeddings, and one
+# decode context per camera plus transcodes - and nothing fails loudly when it
+# fills; the next allocation just fails or silently falls back to CPU.
+NVIDIA_VRAM_WARN_MIB=1536
+NVIDIA_VRAM_CRIT_MIB=512

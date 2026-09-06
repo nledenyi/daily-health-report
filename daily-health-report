@@ -664,6 +664,23 @@ PYEOF
     fi
     if ! nvidia-smi --query-gpu=name --format=csv,noheader &>/dev/null; then
         emit_issue WARN "NVIDIA GPU driver not responding"
+    else
+        # VRAM headroom. This card is shared by several tenants that each grow
+        # independently -- Whisper STT, Frigate embeddings, and one ffmpeg
+        # decode context per camera plus transcodes. Nothing fails loudly when
+        # it fills: the newest allocation just fails, or a model silently falls
+        # back to CPU. Worth knowing BEFORE that happens.
+        local nv_total nv_used nv_free
+        read -r nv_total nv_used <<< "$(nvidia-smi --query-gpu=memory.total,memory.used \
+            --format=csv,noheader,nounits 2>/dev/null | head -1 | tr ',' ' ')"
+        if [ -n "${nv_total:-}" ] && [ -n "${nv_used:-}" ]; then
+            nv_free=$(( nv_total - nv_used ))
+            if [ "$nv_free" -lt "${NVIDIA_VRAM_CRIT_MIB:-512}" ]; then
+                emit_issue CRIT "NVIDIA VRAM nearly exhausted: ${nv_free} MiB free of ${nv_total} MiB — next allocation will fail"
+            elif [ "$nv_free" -lt "${NVIDIA_VRAM_WARN_MIB:-1536}" ]; then
+                emit_issue WARN "NVIDIA VRAM headroom low: ${nv_free} MiB free of ${nv_total} MiB"
+            fi
+        fi
     fi
     if [ -n "${AMD_KFD_LXCS[*]}" ] && [ ! -e /dev/kfd ]; then
         emit_issue WARN "AMD GPU /dev/kfd missing (driver issue)"
