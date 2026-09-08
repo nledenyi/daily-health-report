@@ -1441,8 +1441,21 @@ check_vllm() {
     fi
 
     # Boot log: kernel gate and the KV pool it actually got.
+    #
+    # Scope to the unit's CURRENT invocation, not `-b` + a blind slice. Both the
+    # kernel-gate line and the KV-pool line are emitted during STARTUP, i.e. at
+    # the HEAD of the log, while `tail -N` reads the END. Measured 2026-09-08:
+    # the marker sat at line 422 of a 40,631-line boot log, so `tail -4000`
+    # missed it entirely and the check reported EMULATION every day on a
+    # perfectly healthy server. A false CRIT that trains you to ignore the
+    # report is worse than no check at all.
     if [ -n "$VLLM_LXC" ] && [ -n "$VLLM_UNIT" ]; then
-        BOOTLOG=$(pct exec "$VLLM_LXC" -- journalctl -u "$VLLM_UNIT" -b --no-pager 2>/dev/null | tail -4000)
+        VLLM_UPTIME=$(pct exec "$VLLM_LXC" -- systemctl show "$VLLM_UNIT" -p ActiveEnterTimestamp --value 2>/dev/null | tr -d '\r')
+        if [ -n "$VLLM_UPTIME" ]; then
+            BOOTLOG=$(pct exec "$VLLM_LXC" -- journalctl -u "$VLLM_UNIT" --since "$VLLM_UPTIME" --no-pager 2>/dev/null)
+        else
+            BOOTLOG=$(pct exec "$VLLM_LXC" -- journalctl -u "$VLLM_UNIT" -b --no-pager 2>/dev/null)
+        fi
         if [ -n "$BOOTLOG" ]; then
             if echo "$BOOTLOG" | grep -q "RadianceMxfp4W4A8LinearKernel"; then
                 VLLM_KERNEL="native MXFP4 W4A8"
@@ -1453,7 +1466,6 @@ check_vllm() {
             VLLM_KV=$(echo "$BOOTLOG" | grep -oE "GPU KV cache size: [0-9,]+ tokens" | tail -1 | grep -oE "[0-9,]+")
         fi
         VLLM_RESTARTS=$(pct exec "$VLLM_LXC" -- systemctl show "$VLLM_UNIT" -p NRestarts --value 2>/dev/null)
-        VLLM_UPTIME=$(pct exec "$VLLM_LXC" -- systemctl show "$VLLM_UNIT" -p ActiveEnterTimestamp --value 2>/dev/null)
         if [ -n "$VLLM_RESTARTS" ] && [ "$VLLM_RESTARTS" -gt 0 ] 2>/dev/null; then
             emit_issue WARN "vLLM has restarted $VLLM_RESTARTS time(s) - check for crash-looping"
         fi
@@ -1487,6 +1499,102 @@ check_vllm() {
     fi
 }
 check_vllm
+
+# --- KasmVNC desktop liveness ---
+# An HTTP probe of the KasmVNC port is USELESS: it returns 200 even when the
+# desktop is wedged. That is exactly how a multi-day outage went unnoticed - the
+# dashboard tile stayed green throughout. `xset q` against the X display is the
+# cheapest check that actually exercises the session.
+#
+# Known limit: this proves the X server is alive. It does NOT prove the
+# websocket->VNC leg is healthy, which is the other observed failure mode. A
+# full check would complete a websocket upgrade and wait for the RFB banner, but
+# KasmVNC's websocket endpoint is authenticated and not on the classic
+# /websockify path, so that needs the real client request captured first.
+check_kasm() {
+    KASM_OK="unknown"
+    KASM_DETAIL=""
+
+    [ -z "$KASM_CONTAINER" ] && { KASM_OK="skipped"; return; }
+    [ -z "$DOCKER_VM" ] && { KASM_OK="skipped"; return; }
+
+    if ! qm status "$DOCKER_VM" 2>/dev/null | grep -q running; then
+        KASM_OK="skipped"; return
+    fi
+
+    local state
+    state=$(qm guest exec "$DOCKER_VM" -- docker inspect -f '{{.State.Status}}' "$KASM_CONTAINER" 2>/dev/null | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('out-data','').strip())" 2>/dev/null)
+    if [ "$state" != "running" ]; then
+        KASM_OK="fail"; KASM_DETAIL="container ${state:-missing}"
+        emit_issue WARN "KasmVNC container '$KASM_CONTAINER' is ${state:-missing}"
+        return
+    fi
+
+    local out
+    out=$(qm guest exec "$DOCKER_VM" -- docker exec "$KASM_CONTAINER" \
+              timeout 5 env DISPLAY="${KASM_DISPLAY:-:1}" xset q 2>/dev/null | \
+          python3 -c "import sys,json; print(json.load(sys.stdin).get('exitcode',1))" 2>/dev/null)
+    if [ "$out" = "0" ]; then
+        KASM_OK="ok"; KASM_DETAIL="X display ${KASM_DISPLAY:-:1} responsive"
+    else
+        KASM_OK="fail"; KASM_DETAIL="X display ${KASM_DISPLAY:-:1} not responding"
+        emit_issue WARN "KasmVNC desktop is wedged (xset on ${KASM_DISPLAY:-:1} failed) - restart $KASM_CONTAINER"
+    fi
+}
+check_kasm
+
+# --- Authentik: forward-auth settings that must not drift ---
+# `intercept_header_auth` makes the outpost consume the Authorization header and
+# authenticate it against Authentik itself. For backends that do their own
+# header auth (KasmVNC sends basic auth on its websocket) that silently breaks
+# the app while HTTP requests keep working - a failure that looks like anything
+# except an auth setting. It defaults to TRUE, lives only in Authentik's
+# database, and is not in any versioned file, so an upgrade or a UI edit can
+# reintroduce it. This check exists because it already happened once.
+check_authentik_providers() {
+    AK_OK="unknown"
+    AK_DETAIL=""
+
+    [ -z "$AUTHENTIK_URL" ] && { AK_OK="skipped"; return; }
+    [ -z "$AUTHENTIK_TOKEN" ] && { AK_OK="skipped"; return; }
+    [ ${#AUTHENTIK_NO_HEADER_INTERCEPT[@]} -eq 0 ] && { AK_OK="skipped"; return; }
+
+    local json
+    json=$(curl -sk --connect-timeout 5 --max-time 20 \
+             -H "Authorization: Bearer $AUTHENTIK_TOKEN" \
+             "${AUTHENTIK_URL%/}/api/v3/providers/proxy/?page_size=100" 2>/dev/null)
+    if [ -z "$json" ]; then
+        AK_OK="fail"; AK_DETAIL="API unreachable"
+        emit_issue WARN "Authentik API not responding - cannot verify forward-auth settings"
+        return
+    fi
+
+    local drifted
+    drifted=$(printf '%s' "$json" | python3 -c "
+import sys, json, os
+want = [w for w in os.environ.get('_AK_WANT','').split('|') if w]
+try:
+    res = json.load(sys.stdin).get('results', [])
+except Exception:
+    print('PARSE_ERROR'); raise SystemExit
+bad = [p.get('name','?') for p in res
+       if p.get('name') in want and p.get('intercept_header_auth')]
+print(','.join(bad))
+" 2>/dev/null)
+
+    if [ "$drifted" = "PARSE_ERROR" ]; then
+        AK_OK="fail"; AK_DETAIL="unparseable API response"
+        emit_issue WARN "Authentik provider check: unexpected API response"
+    elif [ -n "$drifted" ]; then
+        AK_OK="fail"; AK_DETAIL="intercept_header_auth re-enabled: $drifted"
+        emit_issue WARN "Authentik intercept_header_auth is back ON for: $drifted - this breaks backends that do their own header auth (e.g. KasmVNC)"
+    else
+        AK_OK="ok"; AK_DETAIL="${#AUTHENTIK_NO_HEADER_INTERCEPT[@]} provider(s) verified"
+    fi
+}
+_AK_WANT=$(IFS='|'; printf '%s' "${AUTHENTIK_NO_HEADER_INTERCEPT[*]}") \
+    check_authentik_providers
 
 # --- Temperatures ---
 # Depends on: SMART_DATA (from check_disks)
@@ -1740,6 +1848,20 @@ INFO_IC=$(printf '\xE2\x84\xB9\xEF\xB8\x8F')
 _tg_kpi() { if [ "$1" = "ok" ]; then echo "$OK $2"; else echo "$FAIL $2"; fi; }
 _tg_kpi_warn() { if [ "$1" = "ok" ]; then echo "$OK $2"; else echo "$WARN_IC $2"; fi; }
 
+# Optional KPI lines: rendered only when the corresponding check is configured,
+# so a lab without KasmVNC or Authentik gets no empty rows.
+EXTRA_KPI=""
+if [ "$KASM_OK" != "skipped" ] && [ "$KASM_OK" != "unknown" ]; then
+    EXTRA_KPI="$(_tg_kpi "$KASM_OK" "KasmVNC")
+ ${KASM_DETAIL}"
+fi
+if [ "$AK_OK" != "skipped" ] && [ "$AK_OK" != "unknown" ]; then
+    [ -n "$EXTRA_KPI" ] && EXTRA_KPI="${EXTRA_KPI}
+"
+    EXTRA_KPI="${EXTRA_KPI}$(_tg_kpi "$AK_OK" "Authentik hdr-auth")
+ ${AK_DETAIL}"
+fi
+
 # OK flags (POOL_OK/POOL_DETAIL, SMART_OK/SMART_DETAIL, GUEST_OK/GUEST_DETAIL,
 # SANOID_OK, SANOID_COV, SYNCOID_OK, CAP_OK/CAP_DETAIL) are set upstream by
 # the corresponding check_* functions.
@@ -1840,6 +1962,7 @@ $(_tg_kpi "$DOCKER_OK" "Docker Services")
  ${DOCKER_TG_SUMMARY}
 $(_tg_kpi "$VLLM_OK" "vLLM")$([ "$VLLM_KERNEL" = "EMULATION" ] && echo " (EMULATION!)")
  ${OLLAMA_TG_SUMMARY}
+${EXTRA_KPI}
 $(_tg_kpi "$MAINT_OK" "Maintenance") $(_tg_kpi_warn "$SANOID_COV" "${SANOID_COVERED_DS}/${SANOID_TOTAL_DS}")
  ${MAINT_SUMMARY}
 $(_tg_kpi_warn "$CAP_OK" "System")

@@ -180,3 +180,20 @@ REMOTE_SITE_HTTPS_URL=""               # e.g. "https://host.tailnet.ts.net" — 
 # fills; the next allocation just fails or silently falls back to CPU.
 NVIDIA_VRAM_WARN_MIB=1536
 NVIDIA_VRAM_CRIT_MIB=512
+
+# --- KasmVNC desktop liveness (optional) -------------------------------------
+# An HTTP probe of the KasmVNC port returns 200 even when the desktop is wedged,
+# so it cannot detect the real failure. This runs `xset q` against the X display
+# inside the container, on DOCKER_VM. Leave KASM_CONTAINER empty to skip.
+KASM_CONTAINER=""                  # e.g. kasmweb-chrome
+KASM_DISPLAY=":1"
+
+# --- Authentik forward-auth drift (optional) ---------------------------------
+# `intercept_header_auth` makes the outpost consume the Authorization header and
+# validate it against Authentik itself, which silently breaks any backend doing
+# its own header auth (e.g. KasmVNC's websocket) while plain HTTP keeps working.
+# It defaults to TRUE and lives only in Authentik's database, so an upgrade or a
+# UI edit can reintroduce it. List the provider names that must keep it OFF.
+AUTHENTIK_URL=""                   # e.g. https://auth.example.com
+AUTHENTIK_TOKEN=""                 # API token, scope=API
+AUTHENTIK_NO_HEADER_INTERCEPT=()   # e.g. ("Chrome Forward Auth")
