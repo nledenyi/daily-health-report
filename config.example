@@ -173,6 +173,34 @@ REMOTE_SITE_HTTPS_URL=""               # e.g. "https://host.tailnet.ts.net" — 
 # NIC at 10 Mbps - belong here or they warn every night.
 #UNIFI_FLAP_EXCLUDE=P04-DeskPC
 #UNIFI_FLAP_WARN_DELTA=1
+# Comma-separated port names (or "Switch/portidx") to ignore for the link-SPEED
+# regression check. That check warns when a port comes up slower than its own
+# best-ever speed, so an absolute floor is not needed - but a port whose device
+# deliberately parks the NIC at a lower speed (WoL, power-saving TVs) belongs
+# here. The baseline is stored beside the flap state, in <state>.speeds.
+#UNIFI_SPEED_EXCLUDE=
+
+# --- dpkg / apt health -------------------------------------------------------
+# Days of no package installs, with upgrades pending, before it is treated as a
+# stall rather than an idle host. The failure this guards against is silent: a
+# wedged dpkg produces no unattended-upgrades log lines, so a check that reads
+# that log sees nothing wrong. Lower it on a host you patch weekly.
+#DPKG_STALE_DAYS=14
+
+# --- Frigate camera streams + GenAI endpoint (optional) ----------------------
+# A camera at 0 fps is invisible to every other check: the container is healthy,
+# the host is up, the switch port shows link and PoE. Only Frigate itself knows.
+# Leave FRIGATE_API empty to skip the whole check.
+#FRIGATE_API=http://192.0.2.20:5000
+#FRIGATE_FPS_MIN=1                 # CRIT below this, per camera
+# Cameras that are expected to be dark (a 3D printer that is usually powered
+# off, a seasonal camera) - otherwise they CRIT every night.
+#FRIGATE_CAMERA_EXCLUDE=
+# Reachability probe for the GenAI/LLM base_url Frigate is configured to use.
+# Object descriptions fail silently when this rots, and it rots independently
+# of the streams - a retired inference backend leaves the URL pointing at a
+# port nothing listens on any more.
+#FRIGATE_GENAI_URL=
 
 # NVIDIA VRAM headroom thresholds (MiB free). The card is shared by several
 # tenants that grow independently - local STT, vision embeddings, and one

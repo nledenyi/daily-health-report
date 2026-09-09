@@ -857,6 +857,7 @@ check_unifi() {
           UNIFI_UPLINK_EXCLUDE="$UNIFI_UPLINK_EXCLUDE" UNIFI_RSSI_CLIENTS="$UNIFI_RSSI_CLIENTS" \
           UNIFI_RSSI_MIN_DBM="$UNIFI_RSSI_MIN_DBM" UNIFI_FLAP_EXCLUDE="$UNIFI_FLAP_EXCLUDE" \
           UNIFI_FLAP_WARN_DELTA="$UNIFI_FLAP_WARN_DELTA" \
+          UNIFI_SPEED_EXCLUDE="$UNIFI_SPEED_EXCLUDE" \
           python3 - <<'PYUNIFI'
 import json, os, ssl, sys, urllib.request, urllib.error, http.cookiejar
 
@@ -869,6 +870,7 @@ CLI = [x.strip() for x in (os.environ.get("UNIFI_RSSI_CLIENTS") or "").split(","
 RMIN= float(os.environ.get("UNIFI_RSSI_MIN_DBM") or -75)
 EXP = [x for x in (os.environ.get("UNIFI_FLAP_EXCLUDE") or "").split(",") if x.strip()]
 FDEL= int(os.environ.get("UNIFI_FLAP_WARN_DELTA") or 1)
+EXS = [x for x in (os.environ.get("UNIFI_SPEED_EXCLUDE") or "").split(",") if x.strip()]
 SITE= os.environ.get("UNIFI_SITE") or "default"
 STATE = os.environ.get("UNIFI_STATE")
 
@@ -982,6 +984,53 @@ for d in devs:
 if STATE:
     try:
         json.dump(cur, open(STATE, "w"))
+    except Exception:
+        pass
+
+# 4. switch ports negotiating below their own historical best.
+#
+# An absolute floor is useless here: plenty of ports are legitimately 100 Mbps
+# forever (FE-only TVs, older cameras) and would warn every single day. What is
+# actually a fault is a REGRESSION — a port that has always linked at 1000 and
+# today came up at 10. So the baseline is per-port max-ever-observed, kept in a
+# sidecar of the flap state, and the check is "below your own baseline".
+#
+# Self-seeding has one blind spot worth knowing: a port that is already degraded
+# the first time this runs gets baselined at the degraded speed and stays quiet
+# until it recovers once. Seed the sidecar by hand for a port that is broken
+# right now.
+SPEED_STATE = (STATE + ".speeds") if STATE else None
+base = {}
+if SPEED_STATE and os.path.exists(SPEED_STATE):
+    try:
+        base = json.load(open(SPEED_STATE))
+    except Exception:
+        base = {}
+newbase = dict(base)
+for d in devs:
+    if d.get("type") != "usw":
+        continue
+    sw = d.get("name") or d.get("mac")
+    for pt in d.get("port_table") or []:
+        if not pt.get("up"):
+            continue                  # a dark port has no speed to judge
+        sp = pt.get("speed")
+        if not sp:
+            continue
+        sp = int(sp)
+        pname = pt.get("name") or ("Port %s" % pt.get("port_idx"))
+        key = "%s/%s" % (sw, pt.get("port_idx"))
+        if pname in EXS or key in EXS:
+            continue
+        was = int(base.get(key) or 0)
+        if was and sp < was:
+            errs = pt.get("rx_errors") or 0
+            print("WARN|UniFi %s %s linked at %d Mbps, was %d%s" % (
+                sw, pname, sp, was, (" (%d rx errors)" % errs) if errs else ""))
+        newbase[key] = max(was, sp)
+if SPEED_STATE:
+    try:
+        json.dump(newbase, open(SPEED_STATE, "w"))
     except Exception:
         pass
 PYUNIFI
@@ -1159,6 +1208,78 @@ PYEOF
     fi
 fi
 
+# --- dpkg / apt health: can this host actually install a package? ---
+# Exports: DPKG_PENDING, DPKG_OK
+#
+# Why this exists: on 2026-09-09 this host was found with dpkg interrupted since
+# 2026-08-18 17:13. Nothing had installed for three weeks, 43 packages were
+# pending including openssl and the ZFS userland, and every single morning this
+# report said "Unattended upgrades: OK (no updates)".
+#
+# The reason it lied is structural, not a bug in check_upgrades: that check reads
+# unattended-upgrades' OWN log. A package system that cannot run at all writes no
+# log lines, so there was nothing to complain about, and absence of failure was
+# rendered as success. Never infer health from a quiet log belonging to the thing
+# you are testing.
+#
+# Three independent probes, because they break at different layers:
+#   1. /var/lib/dpkg/updates/ non-empty - dpkg's journal was never replayed. This
+#      is what was actually true for three weeks, and it is definitive.
+#   2. dpkg --audit - half-installed or half-configured packages.
+#   3. apt-get -s dist-upgrade - what apt says when asked to plan. It refuses
+#      outright while dpkg is interrupted, which is its own clear signal.
+# Plus a staleness rule, to catch the slow version of the same failure even when
+# all three layers look clean.
+check_dpkg_health() {
+    DPKG_PENDING=0
+    DPKG_OK="ok"
+
+    local journal
+    journal=$(ls -1 /var/lib/dpkg/updates/ 2>/dev/null | wc -l)
+    if [ "${journal:-0}" -gt 0 ]; then
+        DPKG_OK="fail"
+        emit_issue CRIT "dpkg is interrupted (${journal} unreplayed journal file(s)) - NO package can install until 'dpkg --configure -a' is run"
+    fi
+
+    local audit
+    audit=$(dpkg --audit 2>/dev/null | grep -c .)
+    if [ "${audit:-0}" -gt 0 ]; then
+        DPKG_OK="fail"
+        emit_issue CRIT "dpkg --audit reports ${audit} line(s) of broken packages - the package system is not consistent"
+    fi
+
+    local plan rc
+    plan=$(DEBIAN_FRONTEND=noninteractive apt-get -s dist-upgrade 2>&1)
+    rc=$?
+    if echo "$plan" | grep -q "dpkg was interrupted"; then
+        DPKG_OK="fail"
+        emit_issue CRIT "apt refuses to plan an upgrade: dpkg was interrupted"
+    elif [ $rc -ne 0 ]; then
+        # Do not swallow this. A silent failure here is exactly how the original
+        # blind spot worked - if apt cannot answer, say so rather than reporting 0.
+        DPKG_OK="fail"
+        emit_issue WARN "apt-get -s dist-upgrade failed (exit $rc) - pending-upgrade count is unknown, not zero"
+    else
+        DPKG_PENDING=$(echo "$plan" | grep -oP '^\K[0-9]+(?= upgraded)' | head -1)
+        DPKG_PENDING=${DPKG_PENDING:-0}
+    fi
+
+    # Staleness: pending work that nobody is applying.
+    # /var/lib/dpkg/status is touched by every install and removal. /var/log/dpkg.log
+    # is NOT usable for this - log rotation resets it, and during the 2026-08 incident
+    # it was 0 bytes while the last real entry sat in dpkg.log.1.
+    if [ "$DPKG_PENDING" -gt 0 ]; then
+        local age_days status_mtime
+        status_mtime=$(stat -c %Y /var/lib/dpkg/status 2>/dev/null || echo 0)
+        age_days=$(( ( $(date +%s) - status_mtime ) / 86400 ))
+        if [ "$age_days" -ge "${DPKG_STALE_DAYS:-14}" ]; then
+            DPKG_OK="fail"
+            emit_issue CRIT "${DPKG_PENDING} package(s) pending and nothing has installed for ${age_days}d - upgrades are stuck, not idle"
+        fi
+    fi
+}
+check_dpkg_health
+
 # --- Unattended Upgrades + Package NEWS ---
 # Exports: UAU_PKG_COUNT, UAU_REBOOT_REQUIRED, UAU_LAST_FMT, UAU_LAST_EXIT,
 #          UAU_STATUS_TEXT, UAU_STATUS_COLOR, APT_NEWS, APT_NEWS_COUNT
@@ -1216,12 +1337,26 @@ check_upgrades() {
     elif [ "$UAU_PKG_COUNT" -gt 0 ]; then
         UAU_STATUS_TEXT="${UAU_PKG_COUNT} upgraded"
         UAU_STATUS_COLOR="#3498db"
+    elif [ "${DPKG_PENDING:-0}" -gt 0 ]; then
+        # Pending upgrades are not "no updates". This branch is the whole reason
+        # the 2026-08 dpkg stall stayed invisible for three weeks.
+        UAU_STATUS_TEXT="${DPKG_PENDING} pending"
+        UAU_STATUS_COLOR="#f39c12"
     elif [ "$UAU_LAST_EXIT" = "0" ]; then
         UAU_STATUS_TEXT="OK (no updates)"
         UAU_STATUS_COLOR="#2ecc71"
+    elif [ -z "$UAU_LAST_EXIT" ]; then
+        # No ExecMainStatus at all: the timer has never fired on this host.
+        UAU_STATUS_TEXT="never run"
+        UAU_STATUS_COLOR="#f39c12"
+        emit_issue WARN "apt-daily-upgrade.service has never run - nothing is applying security updates"
     else
-        UAU_STATUS_TEXT="OK (no updates)"
-        UAU_STATUS_COLOR="#2ecc71"
+        # Previously this arm was a copy of the "= 0" arm, so a FAILED upgrade run
+        # rendered as green "OK (no updates)" - the same shape of lie as the dpkg
+        # stall this report missed for three weeks. A non-zero exit is a finding.
+        UAU_STATUS_TEXT="last run exit ${UAU_LAST_EXIT}"
+        UAU_STATUS_COLOR="#e74c3c"
+        emit_issue WARN "apt-daily-upgrade.service last exited ${UAU_LAST_EXIT} - upgrades are failing, not idle"
     fi
 }
 check_upgrades
@@ -1544,6 +1679,84 @@ check_kasm() {
 }
 check_kasm
 
+# --- Frigate: per-camera stream health + GenAI endpoint (config-driven) ---
+# Emits issues only; no rendered section.
+#
+# Why this exists: a camera at 0 fps is invisible to every other check. The LXC
+# is running, the container is "healthy", the switch port is up and the PoE is
+# good — nothing in the report moves. On 2026-09-09 the `beallo` camera sat at
+# 0 fps for seven hours (link renegotiated to 10 Mbps after a PoE watchdog
+# power-cycle) and the whole LPR/GenAI Telegram pipeline was dead, while the
+# report showed a single WARN about link flaps. This closes that gap.
+#
+# The GenAI probe is separate on purpose: the descriptions ride a different
+# endpoint from the streams, so it can rot on its own (and had — the retired
+# ollama-trace proxy was still configured as the base_url long after the
+# Ollama -> vLLM migration switched it off).
+check_frigate() {
+    [ -n "$FRIGATE_API" ] || return 0
+    local out rc
+    # Same env-passing rule as check_unifi: the config is sourced without
+    # `set -a`, so nothing reaches the child process unless it is listed here.
+    out=$(FRIGATE_API="$FRIGATE_API" \
+          FRIGATE_FPS_MIN="$FRIGATE_FPS_MIN" \
+          FRIGATE_CAMERA_EXCLUDE="$FRIGATE_CAMERA_EXCLUDE" \
+          FRIGATE_GENAI_URL="$FRIGATE_GENAI_URL" \
+          python3 - <<'PYFRIGATE'
+import json, os, sys, urllib.request, urllib.error
+
+API  = (os.environ.get("FRIGATE_API") or "").rstrip("/")
+FMIN = float(os.environ.get("FRIGATE_FPS_MIN") or 1)
+EXC  = [x.strip() for x in (os.environ.get("FRIGATE_CAMERA_EXCLUDE") or "").split(",") if x.strip()]
+GEN  = (os.environ.get("FRIGATE_GENAI_URL") or "").strip()
+
+try:
+    with urllib.request.urlopen(API + "/api/stats", timeout=15) as r:
+        stats = json.loads(r.read().decode() or "{}")
+except Exception as e:
+    print("WARN|Frigate API unreachable (%s: %s)" % (type(e).__name__, str(e)[:120]))
+    sys.exit(0)
+
+cams = stats.get("cameras") or {}
+if not cams:
+    print("WARN|Frigate reported no cameras at all")
+
+down = []
+for name in sorted(cams):
+    if name in EXC:
+        continue
+    fps = cams[name].get("camera_fps")
+    if fps is None:
+        continue
+    if float(fps) < FMIN:
+        down.append("%s (%.1f fps)" % (name, float(fps)))
+
+if down:
+    # One issue per camera: the ladder takes the worst level anyway, and a
+    # per-camera line is what makes the Telegram message actionable.
+    for d in down:
+        print("CRIT|Frigate camera %s is not streaming - no detection, no recording, no snapshots" % d)
+
+if GEN:
+    try:
+        urllib.request.urlopen(GEN, timeout=8)
+    except urllib.error.HTTPError:
+        pass          # any HTTP status means something is listening
+    except Exception as e:
+        print("WARN|Frigate GenAI endpoint %s unreachable (%s) - object descriptions are silently disabled" % (GEN, type(e).__name__))
+PYFRIGATE
+)
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        emit_issue WARN "Frigate check failed to run (exit $rc)"
+        return 0
+    fi
+    while IFS='|' read -r lvl msg; do
+        [ -n "$msg" ] && emit_issue "$lvl" "$msg"
+    done <<< "$out"
+}
+check_frigate
+
 # --- Authentik: forward-auth settings that must not drift ---
 # `intercept_header_auth` makes the outpost consume the Authorization header and
 # authenticate it against Authentik itself. For backends that do their own
@@ -1796,18 +2009,36 @@ set-case-rgb "$RGB_STATUS" 2>/dev/null &
         echo ""
         echo "+ ${DOCKER_OTHER_RUNNING} other running"
     fi
-    echo ""
-    echo "**Ollama (LXC 106)**"
-    echo ""
-    if [ "$OLLAMA_OK" = "ok" ]; then
-        OLLAMA_VER_STR="v${OLLAMA_VERSION}"
-        [ -n "$OLLAMA_UPDATE_AVAIL" ] && OLLAMA_VER_STR="${OLLAMA_VER_STR} (${OLLAMA_UPDATE_AVAIL} available)"
-        echo "${OLLAMA_VER_STR} | ${OLLAMA_MODELS_COUNT} models (${OLLAMA_MODELS_SIZE}) | Loaded: ${OLLAMA_LOADED_MODELS} | GPU: ${OLLAMA_GPU_OFFLOAD}"
-        echo "24h: ${OLLAMA_REQ_24H} requests, ${OLLAMA_ERR_24H} errors, avg ${OLLAMA_AVG_DURATION} | idle ${OLLAMA_IDLE_TIME}"
-        [ -n "$OLLAMA_CLIENTS" ] && echo "Clients: ${OLLAMA_CLIENTS}"
-        echo "Tokens: ${OLLAMA_TOKENS_GENERATED} generated, ${OLLAMA_TOKENS_PROMPT} prompt | ${OLLAMA_TOK_PER_SEC} tok/s"
-    else
-        echo "NOT RESPONDING"
+    # Ollama retired in favour of vLLM (OLLAMA_API blank in config) renders as
+    # "skipped" and is omitted entirely — printing NOT RESPONDING for a service
+    # that was deliberately switched off trains the reader to ignore the line.
+    # The HTML renderer already did this; the markdown one was missed.
+    if [ "$OLLAMA_OK" != "skipped" ]; then
+        echo ""
+        echo "**Ollama (LXC 106)**"
+        echo ""
+        if [ "$OLLAMA_OK" = "ok" ]; then
+            OLLAMA_VER_STR="v${OLLAMA_VERSION}"
+            [ -n "$OLLAMA_UPDATE_AVAIL" ] && OLLAMA_VER_STR="${OLLAMA_VER_STR} (${OLLAMA_UPDATE_AVAIL} available)"
+            echo "${OLLAMA_VER_STR} | ${OLLAMA_MODELS_COUNT} models (${OLLAMA_MODELS_SIZE}) | Loaded: ${OLLAMA_LOADED_MODELS} | GPU: ${OLLAMA_GPU_OFFLOAD}"
+            echo "24h: ${OLLAMA_REQ_24H} requests, ${OLLAMA_ERR_24H} errors, avg ${OLLAMA_AVG_DURATION} | idle ${OLLAMA_IDLE_TIME}"
+            [ -n "$OLLAMA_CLIENTS" ] && echo "Clients: ${OLLAMA_CLIENTS}"
+            echo "Tokens: ${OLLAMA_TOKENS_GENERATED} generated, ${OLLAMA_TOKENS_PROMPT} prompt | ${OLLAMA_TOK_PER_SEC} tok/s"
+        else
+            echo "NOT RESPONDING"
+        fi
+    fi
+
+    if [ "$VLLM_OK" != "skipped" ]; then
+        echo ""
+        echo "**vLLM (LXC ${VLLM_LXC})**"
+        echo ""
+        if [ "$VLLM_OK" = "ok" ]; then
+            echo "${VLLM_MODEL} | kernel ${VLLM_KERNEL:-unknown} | ${VLLM_MAXLEN} ctx$([ -n "$VLLM_KV" ] && echo " | KV ${VLLM_KV}")"
+            echo "Proxy: $([ "$PROXY_OK" = "ok" ] && echo "up" || echo "DOWN")$([ -n "$PROXY_MODELS" ] && echo " (${PROXY_MODELS} aliases)")$([ -n "$VLLM_RESTARTS" ] && echo " | restarts ${VLLM_RESTARTS}")$([ -n "$VLLM_TTFT" ] && echo " | TTFT ${VLLM_TTFT}s")"
+        else
+            echo "NOT RESPONDING"
+        fi
     fi
 
     echo ""
