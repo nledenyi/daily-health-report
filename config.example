@@ -185,6 +185,12 @@ REMOTE_SITE_HTTPS_URL=""               # e.g. "https://host.tailnet.ts.net" — 
 # a port that is genuinely degraded still has its client attached. Reach for
 # this list only for a device that parks at 100 Mbps, or at 10 Mbps while
 # still holding its MAC (some power-saving TVs).
+#
+# CAMERAS are the usual occupants. A camera's link speed is not worth an alert:
+# it is fast-ethernet by design on most models, and a genuinely dead camera is
+# caught far better by the Frigate check below (camera_fps < FRIGATE_FPS_MIN,
+# raised as CRIT). Left unexcluded, one camera on a flaky run will warn every
+# single morning for a fault you have already triaged and accepted.
 #UNIFI_SPEED_EXCLUDE=
 
 # --- dpkg / apt health -------------------------------------------------------
