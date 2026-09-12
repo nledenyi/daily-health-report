@@ -24,7 +24,9 @@ in_array() {
 HOSTNAME=$(hostname)
 DATE=$(date '+%Y-%m-%d %H:%M')
 DATE_SHORT=$(date '+%Y-%m-%d')
-LOG_FILE="${LOG_DIR}/daily-health.md"
+MONTH_SHORT=$(date '+%Y-%m')
+LOG_FILE="${LOG_DIR}/daily-health-${MONTH_SHORT}.md"
+ISSUES_FILE="${LOG_DIR}/daily-health-issues-${MONTH_SHORT}.tsv"
 ISSUES=()
 
 mkdir -p "$LOG_DIR"
@@ -2067,6 +2069,17 @@ set-case-rgb "$RGB_STATUS" 2>/dev/null &
     [ -n "$LXC_UPDATE_SUMMARY" ] && LXC_UPD_LINE=" | LXC updates: ${LXC_UPDATE_SUMMARY}"
     echo "Kernel: ${KERNEL_VER} | PVE: ${PVE_VER} | Packages: ${UPGRADABLE_COUNT} upgradable${LXC_UPD_LINE}"
 } >> "$LOG_FILE"
+
+# ===================== Issues TSV =====================
+# Machine-readable companion to the markdown log: one line per issue,
+# date <TAB> level <TAB> message, appended to a monthly file. The file is
+# created (possibly empty) on every run, so a quiet month still has one.
+for issue in "${ISSUES[@]}"; do
+    msg="${issue#*|}"
+    msg="${msg//$'\t'/ }"
+    msg="${msg//$'\n'/ }"
+    printf '%s\t%s\t%s\n' "$DATE_SHORT" "${issue%%|*}" "$msg"
+done >> "$ISSUES_FILE"
 
 # ===================== Telegram =====================
 

@@ -7,7 +7,8 @@
 # Default to `hostname`; override if your PVE node name differs.
 PVE_NODE="${PVE_NODE:-$(hostname)}"
 
-# Output directory for the appended markdown log. The directory is created if missing.
+# Output directory for the monthly markdown log (daily-health-YYYY-MM.md) and the
+# monthly issues TSV (daily-health-issues-YYYY-MM.tsv). Created if missing.
 LOG_DIR="/var/log/daily-health"
 
 # Email "From:" header. Must match your postfix/msmtp sender config.

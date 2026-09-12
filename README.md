@@ -4,7 +4,8 @@ Opinionated, single-file daily health report for a **Proxmox VE** host (single-n
 
 - **Telegram message** — one-line KPI per section, with a worst-severity icon
 - **HTML email** — compact dark-theme tables, one section per concern
-- **Markdown log** — appended to a dated file, suitable for grep/tail/git
+- **Markdown log** — appended to a monthly file `$LOG_DIR/daily-health-YYYY-MM.md`, suitable for grep/tail/git
+- **Issues TSV** — one line per issue (`date<TAB>level<TAB>message`) appended to `$LOG_DIR/daily-health-issues-YYYY-MM.tsv`, for trend queries
 
 ...and drives case RGB lighting (green / amber / red) via an external hook, so the severity of the last report is visible at a glance.
 
@@ -53,8 +54,8 @@ Three concerns, sharply separated:
          ┌────────────────┼────────────────┐
          ▼                ▼                ▼
    Markdown renderer  Telegram        HTML email
-   (append to log)    (KPI lines)     (dark-theme
-                                       tables)
+   + issues TSV       (KPI lines)     (dark-theme
+   (monthly files)                     tables)
                           │
                           ▼
                  set-case-rgb worst-severity
