@@ -1034,8 +1034,8 @@ for d in devs:
         # and it stays narrow, because a genuinely degraded port still has its
         # client attached, so mac_table_count >= 1 and the warning survives.
         # Verified against the live controller the same day: P03-LianLi asleep
-        # is 10 Mbps / 0 MACs, P06-Előkert (an AP that really did fall to
-        # 10 Mbps) is 10 Mbps / 1 MAC and still fires.
+        # is 10 Mbps / 0 MACs, while P06-Előkert (a camera whose link really had
+        # fallen to 10 Mbps) is 10 Mbps / 1 MAC and still fires.
         if sp == 10 and not (pt.get("mac_table_count") or 0):
             continue
         was = int(base.get(key) or 0)
