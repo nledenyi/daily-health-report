@@ -176,9 +176,15 @@ REMOTE_SITE_HTTPS_URL=""               # e.g. "https://host.tailnet.ts.net" — 
 #UNIFI_FLAP_WARN_DELTA=1
 # Comma-separated port names (or "Switch/portidx") to ignore for the link-SPEED
 # regression check. That check warns when a port comes up slower than its own
-# best-ever speed, so an absolute floor is not needed - but a port whose device
-# deliberately parks the NIC at a lower speed (WoL, power-saving TVs) belongs
-# here. The baseline is stored beside the flap state, in <state>.speeds.
+# best-ever speed, so an absolute floor is not needed. The baseline is stored
+# beside the flap state, in <state>.speeds.
+#
+# You usually do NOT need this for Wake-on-LAN. A sleeping desktop holds the
+# link up at the 10 Mbps WoL PHY rate with an EMPTY MAC table, and that exact
+# signature (speed == 10 and mac_table_count == 0) is skipped automatically -
+# a port that is genuinely degraded still has its client attached. Reach for
+# this list only for a device that parks at 100 Mbps, or at 10 Mbps while
+# still holding its MAC (some power-saving TVs).
 #UNIFI_SPEED_EXCLUDE=
 
 # --- dpkg / apt health -------------------------------------------------------

@@ -1024,6 +1024,20 @@ for d in devs:
         key = "%s/%s" % (sw, pt.get("port_idx"))
         if pname in EXS or key in EXS:
             continue
+        # Wake-on-LAN, not a regression. A sleeping desktop holds its link UP at
+        # the 10 Mbps WoL PHY rate with an empty MAC table. That signature is
+        # already documented in UNIFI_FLAP_EXCLUDE's config comment, and those
+        # same ports are excluded from the FLAP check - but this check was added
+        # later (2026-09-09) and never inherited that list, which is why
+        # P03-LianLi warned on 2026-09-12 while the user believed it was muted.
+        # Deliberately a signature and not a port list: it needs no maintenance,
+        # and it stays narrow, because a genuinely degraded port still has its
+        # client attached, so mac_table_count >= 1 and the warning survives.
+        # Verified against the live controller the same day: P03-LianLi asleep
+        # is 10 Mbps / 0 MACs, P06-Előkert (an AP that really did fall to
+        # 10 Mbps) is 10 Mbps / 1 MAC and still fires.
+        if sp == 10 and not (pt.get("mac_table_count") or 0):
+            continue
         was = int(base.get(key) or 0)
         if was and sp < was:
             errs = pt.get("rx_errors") or 0
