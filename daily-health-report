@@ -228,7 +228,7 @@ check_sanoid_coverage() {
 
     for ds in $ALL_ZFS_GUEST_DS; do
         SANOID_TOTAL_DS=$((SANOID_TOTAL_DS + 1))
-        if echo "$SANOID_MANAGED" | grep -qF "$ds"; then
+        if grep -qF "$ds" <<< "$SANOID_MANAGED"; then
             SANOID_COVERED_DS=$((SANOID_COVERED_DS + 1))
         else
             dsname=$(echo "$ds" | sed 's/.*\///')
@@ -1311,7 +1311,7 @@ check_upgrades() {
         if [ -n "$UAU_UPGRADED" ]; then
             UAU_PKG_COUNT=$(echo "$UAU_UPGRADED" | wc -w)
         fi
-        if echo "$UAU_TODAY_LOG" | grep -qiE 'ERROR|WARNING.*dpkg|failed'; then
+        if grep -qiE 'ERROR|WARNING.*dpkg|failed' <<< "$UAU_TODAY_LOG"; then
             UAU_ERROR=$(echo "$UAU_TODAY_LOG" | grep -iE 'ERROR|WARNING.*dpkg|failed' | tail -1)
         fi
     fi
@@ -1608,7 +1608,7 @@ check_vllm() {
             BOOTLOG=$(pct exec "$VLLM_LXC" -- journalctl -u "$VLLM_UNIT" -b --no-pager 2>/dev/null)
         fi
         if [ -n "$BOOTLOG" ]; then
-            if echo "$BOOTLOG" | grep -q "RadianceMxfp4W4A8LinearKernel"; then
+            if grep -q "RadianceMxfp4W4A8LinearKernel" <<< "$BOOTLOG"; then
                 VLLM_KERNEL="native MXFP4 W4A8"
             else
                 VLLM_KERNEL="EMULATION"
