@@ -224,9 +224,18 @@ check_sanoid_coverage() {
     SANOID_TOTAL_DS=0
     SANOID_COVERED_DS=0
 
+    # Guest datasets deliberately left unsnapshotted (SANOID_DS_EXCLUDE). These
+    # are skipped outright rather than counted as covered: adding a dummy
+    # sanoid.conf section would silence this check by making the ratio read 8/8
+    # when one guest has no snapshots at all, and that lie outlives whoever told
+    # it. Skipping keeps the ratio honest about what is actually protected.
+    local -a SANOID_EX=()
+    IFS=',' read -r -a SANOID_EX <<< "${SANOID_DS_EXCLUDE:-}"
+
     ALL_ZFS_GUEST_DS=$(grep -h 'rootfs:\|scsi0:\|virtio0:' /etc/pve/nodes/${PVE_NODE}/qemu-server/*.conf /etc/pve/nodes/${PVE_NODE}/lxc/*.conf 2>/dev/null | grep -oE "${ZFS_POOLS_REGEX}[^ ,]*" | sed 's/:/\//' | sort -u)
 
     for ds in $ALL_ZFS_GUEST_DS; do
+        in_array "$ds" "${SANOID_EX[@]}" && continue
         SANOID_TOTAL_DS=$((SANOID_TOTAL_DS + 1))
         if grep -qF "$ds" <<< "$SANOID_MANAGED"; then
             SANOID_COVERED_DS=$((SANOID_COVERED_DS + 1))
@@ -1650,6 +1659,57 @@ check_vllm() {
     fi
 }
 check_vllm
+
+# --- vLLM stack repo drift (LXC $VLLM_LXC) ---
+# The MXFP4 serving stack is two upstream git checkouts (the radiance engine
+# patches and the launcher), both described upstream as "early dev, experimental,
+# not production hardened". They are NOT auto-updated on purpose: this card backs
+# HA Assist, Frigate GenAI, OpenWebUI and the remote client, and a bad commit
+# degrades all four with nothing in the request path logging an error.
+#
+# Commit COUNT is deliberately not the trigger. These repos are high-churn and
+# mostly docs, so "246 commits behind" is both normal and uninformative, and a
+# line that says it every day gets ignored. AGE is the useful signal: it fires
+# only when a maintenance pass is genuinely due.
+check_vllm_repo_drift() {
+    local repo upstream head_epoch tip_epoch days behind dirty
+    [ -n "$VLLM_LXC" ] || return 0
+    [ "${#VLLM_REPO_PATHS[@]}" -gt 0 ] || return 0
+
+    for repo in "${VLLM_REPO_PATHS[@]}"; do
+        if ! pct exec "$VLLM_LXC" -- test -d "$repo/.git" 2>/dev/null; then
+            emit_issue WARN "vLLM stack repo missing or not a git checkout: $repo (in LXC $VLLM_LXC)"
+            continue
+        fi
+
+        # Uncommitted edits guarantee the next pull conflicts, and hand-patching a
+        # serving script is exactly the change nobody remembers making.
+        dirty=$(pct exec "$VLLM_LXC" -- git -C "$repo" status --porcelain 2>/dev/null | tr -d '\r' | grep -c .)
+        if [ "${dirty:-0}" -gt 0 ]; then
+            emit_issue WARN "vLLM stack repo has $dirty uncommitted change(s): $repo - the next update will conflict"
+        fi
+
+        # A fetch failure is not worth alerting on (transient network), but it must
+        # not be reported as "up to date" either, so the age check simply skips.
+        pct exec "$VLLM_LXC" -- timeout 60 git -C "$repo" fetch --quiet 2>/dev/null || continue
+
+        upstream=$(pct exec "$VLLM_LXC" -- git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null | tr -d '\r')
+        [ -n "$upstream" ] || continue
+
+        head_epoch=$(pct exec "$VLLM_LXC" -- git -C "$repo" log -1 --format=%ct HEAD 2>/dev/null | tr -d '\r')
+        tip_epoch=$(pct exec "$VLLM_LXC" -- git -C "$repo" log -1 --format=%ct "$upstream" 2>/dev/null | tr -d '\r')
+        [ -n "$head_epoch" ] && [ -n "$tip_epoch" ] || continue
+
+        # Measured against upstream's newest commit, not against today, so a repo
+        # that has simply gone quiet upstream never drifts.
+        days=$(( (tip_epoch - head_epoch) / 86400 ))
+        [ "$days" -gt "${VLLM_REPO_DRIFT_DAYS:-30}" ] || continue
+
+        behind=$(pct exec "$VLLM_LXC" -- git -C "$repo" rev-list --count "HEAD..$upstream" 2>/dev/null | tr -d '\r')
+        emit_issue WARN "vLLM stack repo $(basename "$repo") is ${days}d behind $upstream (${behind:-?} commits) - due a maintenance pass; update and re-probe throughput before trusting it"
+    done
+}
+check_vllm_repo_drift
 
 # --- KasmVNC desktop liveness ---
 # An HTTP probe of the KasmVNC port is USELESS: it returns 200 even when the

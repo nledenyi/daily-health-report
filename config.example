@@ -26,6 +26,10 @@ VLLM_API="http://192.168.1.20:8000"
 VLLM_LXC=106                      # LXC hosting the vLLM systemd unit
 VLLM_UNIT="vllm-qwen38"           # unit name, used for the boot-log kernel check
 VLLM_MAXLEN_EXPECTED=204800       # warn if the served context silently shrinks
+# Git checkouts that make up the vLLM serving stack, inside VLLM_LXC. Checked for
+# age against their upstream tip, NOT auto-updated. Empty array = skip the check.
+VLLM_REPO_PATHS=()                # e.g. ("/opt/engine/patches" "/opt/engine/launchers")
+VLLM_REPO_DRIFT_DAYS=30           # WARN once the checkout is this many days behind upstream's newest commit
 
 # LLM proxy in front of vLLM (LiteLLM). Every consumer routes through this,
 # so it is checked separately from the model server.
@@ -67,6 +71,17 @@ VZDUMP_LOG_GLOB="/var/lib/vz/dump/*.log"
 # this many hours on the job's storage (catches silently-skipped guests when
 # the per-job email is disabled). 0 or empty = skip the freshness check.
 VZDUMP_MAX_AGE_H=192    # 8 days, for a weekly schedule
+
+# ZFS guest datasets deliberately NOT snapshotted, comma-separated with no space
+# after the comma. The sanoid coverage check skips these outright instead of
+# counting them as covered, so the reported ratio keeps telling the truth about
+# what is actually protected. (Adding a dummy sanoid.conf section would also
+# silence the warning, but it makes the report claim full coverage for a guest
+# that has no snapshots at all.)
+# Use for guests whose whole point is being disposable - a honeypot, a scratch
+# builder - and record WHY next to the entry. Excluding a guest from snapshots
+# is not a reason to exclude it from the update or backup checks.
+SANOID_DS_EXCLUDE=""
 
 # Custom file-freshness checks for cron/timer backups whose only signal is a
 # sentinel or dump file. Each entry: "Label|path_or_glob|warn_hours|crit_hours".
